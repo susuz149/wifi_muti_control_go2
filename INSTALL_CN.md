@@ -29,7 +29,7 @@ sudo apt install -y python3 python3-venv python3-pip git portaudio19-dev
 从 GitHub 克隆：
 
 ```bash
-git clone <你的 GitHub 仓库地址>
+git clone https://github.com/Uoghluvm/go2_air_wifi_multi_control.git
 cd go2_air_wifi_multi_control
 ```
 
