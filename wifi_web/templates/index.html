@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Go2 Air Wi-Fi 控制台</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <header>
+      <div>
+        <p class="eyebrow">LOCALSTA / WEBRTC DATA CHANNEL</p>
+        <h1>Go2 Air 多机控制台</h1>
+        <p class="subtitle">局域网扫描、编号连接与分组运动控制。音频通道已禁用。</p>
+      </div>
+      <div class="badge"><span id="connectedCount">0</span> 台已连接</div>
+    </header>
+
+    <main>
+      <section class="panel discovery">
+        <div class="panel-title">
+          <h2>设备发现</h2>
+          <button id="scanButton" class="primary">扫描当前 Wi-Fi</button>
+        </div>
+        <label class="inline"><input id="autoConnect" type="checkbox"> 扫描后自动连接发现的候选设备并验证为 Go2</label>
+        <label class="field">扫描网段
+          <input id="scanSubnet" value="192.168.12.0/24" placeholder="192.168.12.0/24">
+        </label>
+        <div class="manual">
+          <input id="manualIp" placeholder="手动输入 IP，例如 192.168.12.14">
+          <button id="addButton">添加设备</button>
+        </div>
+        <p id="scanMessage" class="message">扫描结果将按发现顺序编号；端口候选连接成功后才确认为 Go2。</p>
+      </section>
+
+      <section class="panel robots">
+        <div class="panel-title">
+          <h2>机器人编号与选择</h2>
+          <div class="actions">
+            <button id="selectAllButton">全选</button>
+            <button id="selectNoneButton">清空</button>
+            <button id="connectButton">连接选中</button>
+            <button id="disconnectButton">断开选中</button>
+          </div>
+        </div>
+        <div id="deviceList" class="device-list empty">尚未发现设备</div>
+      </section>
+
+      <section class="panel control">
+        <div class="panel-title">
+          <div>
+            <h2>选中设备控制</h2>
+            <p class="message">动作仅发送到列表中勾选的编号；可单选、任意多选或全选。</p>
+          </div>
+          <button id="stopButton" class="stop">全部紧急停止</button>
+        </div>
+
+        <div class="safety">
+          <label><input id="confirmMotion" type="checkbox"> 已确认机器人周围安全，允许向选中设备发送真机动作</label>
+          <label class="danger-check"><input id="confirmHighRisk" type="checkbox"> 单独允许高风险动作：空翻、跳跃、直立/倒立、卸力</label>
+        </div>
+
+        <div class="settings">
+          <label>平移速度 m/s <input id="speed" type="number" min="0.01" max="0.5" step="0.01" value="0.15"></label>
+          <label>转速 rad/s <input id="yawRate" type="number" min="0.01" max="1" step="0.01" value="0.35"></label>
+          <label>脉冲时长 s <input id="duration" type="number" min="0.05" max="1" step="0.05" value="0.25"></label>
+        </div>
+
+        <div class="remote">
+          <div class="remote-top">
+            <span>GO2 REMOTE</span>
+            <button data-command="stop" class="stop compact">停止选中</button>
+          </div>
+          <div class="sticks">
+            <div class="stick-set">
+              <p>左摇杆</p>
+              <div id="leftStick" class="stick" aria-label="左摇杆，前后与侧移">
+                <span class="axis-y">前</span><span class="axis-x left">左</span><span class="axis-x right">右</span><span class="axis-y bottom">后</span>
+                <div class="knob"></div>
+              </div>
+              <small>前后 / 侧移</small>
+            </div>
+            <div class="stick-readout">
+              <span>vx <b id="vxValue">0.00</b></span>
+              <span>vy <b id="vyValue">0.00</b></span>
+              <span>wz <b id="wzValue">0.00</b></span>
+            </div>
+            <div class="stick-set">
+              <p>右摇杆</p>
+              <div id="rightStick" class="stick" aria-label="右摇杆，左右转向">
+                <span class="axis-x left">左转</span><span class="axis-x right">右转</span>
+                <div class="knob"></div>
+              </div>
+              <small>转向</small>
+            </div>
+          </div>
+          <p class="message deadman">拖动期间持续发指令；释放摇杆或窗口失焦立即发送停止。</p>
+        </div>
+        <p id="controlMessage" class="message"></p>
+      </section>
+
+      <section class="panel sdk-panel">
+        <div class="panel-title sdk-title">
+          <div>
+            <h2>Sport SDK 动作目录</h2>
+            <p class="message">显示已安装 `unitree_webrtc_connect` 提供的全部动作 API；动作会发送到当前勾选的编号。</p>
+          </div>
+          <label class="profile">协议模式
+            <select id="sportProfile"></select>
+          </label>
+        </div>
+        <div id="profileNote" class="profile-note"></div>
+        <div id="sportCatalog" class="catalog"></div>
+      </section>
+    </main>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
