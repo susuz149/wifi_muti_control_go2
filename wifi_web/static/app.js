@@ -43,7 +43,7 @@ function renderDevices() {
     const identity = device.sn
       ? `SN ${device.sn}`
       : device.verified
-        ? "已验证 Go2"
+        ? `已验证 Go2${device.avoid_enabled ? " / 自由避障已开启" : " / 自由避障未确认"}`
         : device.source === "probe"
           ? "信令端口候选，待连接验证"
           : device.source === "manual"

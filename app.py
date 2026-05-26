@@ -20,7 +20,7 @@ from flask import Flask, jsonify, render_template, request
 sys.modules.setdefault("sounddevice", types.ModuleType("sounddevice"))
 
 import unitree_webrtc_connect.webrtc_driver as webrtc_driver
-from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD, SPORT_CMD_MCF
+from unitree_webrtc_connect.constants import OBSTACLES_AVOID_API, RTC_TOPIC, SPORT_CMD, SPORT_CMD_MCF
 from unitree_webrtc_connect.multicast_scanner import discover_ip_sn
 
 
@@ -185,6 +185,7 @@ class Device:
     source: str = "manual"
     verified: bool = False
     connected: bool = False
+    avoid_enabled: bool = False
     busy: bool = False
     error: str = ""
     last_seen: float = field(default_factory=time.time)
@@ -197,6 +198,7 @@ class Device:
             "source": self.source,
             "verified": self.verified,
             "connected": self.connected,
+            "avoid_enabled": self.avoid_enabled,
             "busy": self.busy,
             "error": self.error,
             "last_seen": self.last_seen,
@@ -326,14 +328,21 @@ class MultiGo2Service:
         try:
             await asyncio.wait_for(conn.connect(), timeout=20.0)
             self.connections[device.number] = conn
-            self.set_status(device.number, connected=True, verified=True, busy=False)
-            return {"number": device.number, "ok": True}
+            avoid_enabled = await self._enable_obstacle_avoid(conn)
+            self.set_status(
+                device.number,
+                connected=True,
+                verified=True,
+                avoid_enabled=avoid_enabled,
+                busy=False,
+            )
+            return {"number": device.number, "ok": True, "avoid_enabled": avoid_enabled}
         except Exception as exc:
             try:
                 await conn.disconnect()
             except Exception:
                 pass
-            self.set_status(device.number, connected=False, busy=False, error=str(exc))
+            self.set_status(device.number, connected=False, avoid_enabled=False, busy=False, error=str(exc))
             return {"number": device.number, "ok": False, "error": str(exc)}
 
     async def disconnect(self, numbers):
@@ -352,7 +361,7 @@ class MultiGo2Service:
             except Exception as exc:
                 self.set_status(number, connected=False, error=str(exc))
                 return {"number": number, "ok": False, "error": str(exc)}
-        self.set_status(number, connected=False, error="")
+        self.set_status(number, connected=False, avoid_enabled=False, error="")
         return {"number": number, "ok": True}
 
     def connected_connections(self, numbers):
@@ -377,7 +386,7 @@ class MultiGo2Service:
                 await self._sport_request(conn, SPORT_CMD["StopMove"])
                 response = None
             elif name == "joystick":
-                self._move_without_reply(conn, parameters["x"], parameters["y"], parameters["z"])
+                self._publish_wireless_controller(conn, parameters["lx"], parameters["ly"], parameters["rx"])
                 self._arm_joystick_deadman(number, conn)
                 response = None
             elif name == "sport_action":
@@ -406,6 +415,7 @@ class MultiGo2Service:
     async def _joystick_deadman(self, number, conn):
         try:
             await asyncio.sleep(0.35)
+            self._publish_wireless_controller(conn)
             await self._sport_request(conn, SPORT_CMD["StopMove"])
         except asyncio.CancelledError:
             return
@@ -438,6 +448,54 @@ class MultiGo2Service:
             "binary": [],
         }
         conn.datachannel.pub_sub.publish_without_callback(RTC_TOPIC["SPORT_MOD"], payload)
+
+    @staticmethod
+    def _publish_wireless_controller(conn, lx=0.0, ly=0.0, rx=0.0, ry=0.0, keys=0):
+        conn.datachannel.pub_sub.publish_without_callback(
+            RTC_TOPIC["WIRELESS_CONTROLLER"],
+            {"lx": lx, "ly": ly, "rx": rx, "ry": ry, "keys": keys},
+        )
+
+    async def _enable_obstacle_avoid(self, conn):
+        responses = []
+        for _attempt in range(2):
+            responses.append(
+                await self._obstacle_avoid_request(
+                    conn, OBSTACLES_AVOID_API["SWITCH_SET"], {"enable": True}
+                )
+            )
+            await asyncio.sleep(0.2)
+        code, enabled = await self._query_obstacle_avoid(conn)
+        if enabled is not True:
+            # Some firmware versions expose MCF FreeAvoid in addition to the
+            # obstacle-avoid service. Enabling both keeps the browser default conservative.
+            await self._sport_request(conn, SPORT_CMD_MCF["FreeAvoid"], {"data": True})
+            code, enabled = await self._query_obstacle_avoid(conn)
+        if enabled is not True:
+            raise RuntimeError(f"自动开启自由避障失败，状态={enabled}, code={code}, responses={responses}")
+        return True
+
+    @staticmethod
+    async def _obstacle_avoid_request(conn, api_id, parameter=None):
+        options = {"api_id": api_id}
+        if parameter is not None:
+            options["parameter"] = parameter
+        return await asyncio.wait_for(
+            conn.datachannel.pub_sub.publish_request_new(RTC_TOPIC["OBSTACLES_AVOID"], options),
+            timeout=3.0,
+        )
+
+    async def _query_obstacle_avoid(self, conn):
+        response = await self._obstacle_avoid_request(conn, OBSTACLES_AVOID_API["SWITCH_GET"])
+        code = response.get("data", {}).get("header", {}).get("status", {}).get("code", -1)
+        data = response.get("data", {}).get("data", "")
+        enabled = None
+        if code == 0 and data:
+            try:
+                enabled = json.loads(data).get("enable")
+            except (TypeError, ValueError):
+                enabled = None
+        return code, enabled
 
     async def stop_and_disconnect_all(self):
         numbers = list(self.connections)
@@ -528,10 +586,14 @@ def movement_parameters(data):
 
 
 def joystick_parameters(data):
+    x = bounded_float(data, "x", 0.0, -MAX_SPEED, MAX_SPEED)
+    y = bounded_float(data, "y", 0.0, -MAX_SPEED, MAX_SPEED)
+    z = bounded_float(data, "z", 0.0, -MAX_YAW_RATE, MAX_YAW_RATE)
     return {
-        "x": bounded_float(data, "x", 0.0, -MAX_SPEED, MAX_SPEED),
-        "y": bounded_float(data, "y", 0.0, -MAX_SPEED, MAX_SPEED),
-        "z": bounded_float(data, "z", 0.0, -MAX_YAW_RATE, MAX_YAW_RATE),
+        # Obstacle avoidance filters simulated remote-controller commands.
+        "lx": y / MAX_SPEED,
+        "ly": x / MAX_SPEED,
+        "rx": z / MAX_YAW_RATE,
     }
 
 
