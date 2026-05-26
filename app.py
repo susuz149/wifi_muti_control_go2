@@ -386,7 +386,12 @@ class MultiGo2Service:
                 await self._sport_request(conn, SPORT_CMD["StopMove"])
                 response = None
             elif name == "joystick":
-                self._publish_wireless_controller(conn, parameters["lx"], parameters["ly"], parameters["rx"])
+                if parameters["mode"] == "sport":
+                    self._move_without_reply(conn, parameters["x"], parameters["y"], parameters["z"])
+                else:
+                    self._publish_wireless_controller(
+                        conn, parameters["lx"], parameters["ly"], parameters["rx"]
+                    )
                 self._arm_joystick_deadman(number, conn)
                 response = None
             elif name == "sport_action":
@@ -589,7 +594,14 @@ def joystick_parameters(data):
     x = bounded_float(data, "x", 0.0, -MAX_SPEED, MAX_SPEED)
     y = bounded_float(data, "y", 0.0, -MAX_SPEED, MAX_SPEED)
     z = bounded_float(data, "z", 0.0, -MAX_YAW_RATE, MAX_YAW_RATE)
+    mode = str(data.get("joystick_mode", "wireless")).lower()
+    if mode not in {"wireless", "sport"}:
+        raise ValueError("摇杆通道必须是 wireless 或 sport")
     return {
+        "mode": mode,
+        "x": x,
+        "y": y,
+        "z": z,
         # Obstacle avoidance filters simulated remote-controller commands.
         "lx": y / MAX_SPEED,
         "ly": x / MAX_SPEED,

@@ -64,6 +64,12 @@
           <label>平移速度 m/s <input id="speed" type="number" min="0.01" max="0.5" step="0.01" value="0.15"></label>
           <label>转速 rad/s <input id="yawRate" type="number" min="0.01" max="1" step="0.01" value="0.35"></label>
           <label>脉冲时长 s <input id="duration" type="number" min="0.05" max="1" step="0.05" value="0.25"></label>
+          <label>摇杆通道
+            <select id="joystickMode">
+              <option value="wireless">无线遥控器输入（默认，走避障）</option>
+              <option value="sport">Sport Move（绕开避障过滤）</option>
+            </select>
+          </label>
         </div>
 
         <div class="remote">
@@ -94,7 +100,7 @@
               <small>转向</small>
             </div>
           </div>
-          <p class="message deadman">拖动期间持续发指令；释放摇杆或窗口失焦立即发送停止。</p>
+          <p id="joystickModeNote" class="message deadman">拖动期间持续发指令；释放摇杆或窗口失焦立即发送停止。</p>
         </div>
         <p id="controlMessage" class="message"></p>
       </section>

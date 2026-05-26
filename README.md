@@ -18,7 +18,9 @@ This project uses `unitree_webrtc_connect` over LocalSTA WebRTC data channels. I
   - Window blur/hidden sends `StopMove`.
   - Backend stops joystick motion if refresh commands stop arriving.
 - Obstacle avoidance is enabled automatically after each successful WebRTC connection.
-- Joystick motion is sent through the simulated wireless-controller topic, so the obstacle-avoidance service can filter movement.
+- Joystick channel is selectable:
+  - `wirelesscontroller` simulated remote input is the default and is filtered by obstacle avoidance.
+  - `Sport Move` can be selected when the user deliberately wants direct motion that bypasses obstacle-avoidance filtering.
 - Sport SDK action catalog:
   - Normal / legacy profile.
   - MCF profile for firmware modes using MCF API IDs.
@@ -63,6 +65,7 @@ The UI deliberately blocks normal motion until the safety checkbox is enabled. H
 - Default scan subnet: `192.168.12.0/24`.
 - Known Go2 LocalSTA signaling ports checked by scanner: `9991` and `8081`.
 - After connection, the app calls `rt/api/obstacles_avoid/request` with `SWITCH_SET {"enable": true}` and verifies the state with `SWITCH_GET`.
+- Default joystick channel is `rt/wirelesscontroller`. The UI can switch to `rt/api/sport/request` `Move` for direct control.
 - For Go2 firmware `>= 1.1.15`, Unitree LAN signaling may require a per-device AES key. This project is currently scoped for firmware `< 1.1.15`.
 
 ---
@@ -89,7 +92,9 @@ The UI deliberately blocks normal motion until the safety checkbox is enabled. H
   - 页面失焦或切到后台发送 `StopMove`。
   - 后端在摇杆指令中断后自动停止。
 - 每次连接成功后自动开启自由避障。
-- 摇杆控制通过模拟无线遥控器话题发送，因此 Go2 的避障服务可以拦截和过滤运动指令。
+- 摇杆通道可选择：
+  - 默认 `wirelesscontroller` 模拟无线遥控器输入，Go2 避障服务会过滤运动。
+  - 可手动切换到 `Sport Move`，用于明确需要绕开避障过滤的直接控制。
 - Sport SDK 动作目录：
   - `Normal / legacy`
   - `MCF (firmware >= 1.1.7)`
@@ -141,8 +146,9 @@ http://127.0.0.1:8090
 4. 勾选要控制的机器人编号。
 5. 点击“连接选中”。
 6. 连接成功后页面会显示“自由避障已开启”。
-7. 勾选安全确认后使用双摇杆。
-8. 对高风险动作，需要额外勾选高风险确认并通过浏览器弹窗确认。
+7. 选择摇杆通道：默认“无线遥控器输入（走避障）”；需要绕开避障时手动切到 `Sport Move`。
+8. 勾选安全确认后使用双摇杆。
+9. 对高风险动作，需要额外勾选高风险确认并通过浏览器弹窗确认。
 
 ## 安全说明
 

@@ -118,7 +118,7 @@ http://127.0.0.1:8090
 8. 松开摇杆会自动停止。
 9. “全部紧急停止”会对所有已连接设备发送停止。
 
-说明：摇杆控制通过 `rt/wirelesscontroller` 模拟无线遥控器输入发送，Go2 的避障服务会拦截这类指令并做安全过滤。程序连接成功后会调用 `rt/api/obstacles_avoid/request` 开启避障并查询确认。
+说明：默认摇杆控制通过 `rt/wirelesscontroller` 模拟无线遥控器输入发送，Go2 的避障服务会拦截这类指令并做安全过滤。程序连接成功后会调用 `rt/api/obstacles_avoid/request` 开启避障并查询确认。页面也可以手动切换到 `Sport Move`，这会绕开避障过滤，只应在完全安全、需要直接控制时使用。
 
 ## 9. Sport SDK 动作
 

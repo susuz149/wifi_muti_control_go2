@@ -150,6 +150,7 @@ async function sendCommand(command, extra = {}, all = false, quiet = false) {
         speed: byId("speed").value,
         yaw_rate: byId("yawRate").value,
         duration: byId("duration").value,
+        joystick_mode: byId("joystickMode").value,
         ...extra,
       }),
     });
@@ -294,6 +295,14 @@ function showVelocity(velocity) {
   byId("wzValue").textContent = velocity.z.toFixed(2);
 }
 
+function updateJoystickModeNote() {
+  const mode = byId("joystickMode").value;
+  byId("joystickModeNote").textContent = mode === "wireless"
+    ? "当前使用无线遥控器输入：Go2 避障服务会过滤摇杆运动。释放摇杆或窗口失焦立即停止。"
+    : "当前使用 Sport Move：会绕开避障过滤，只在完全安全、需要直接控制时使用。释放摇杆或窗口失焦立即停止。";
+  byId("joystickModeNote").style.color = mode === "wireless" ? "" : "#ffb4a9";
+}
+
 async function publishJoystick() {
   if (state.joystickInFlight || (!sticks.left.active && !sticks.right.active)) return;
   const velocity = velocityFromSticks();
@@ -377,11 +386,16 @@ byId("selectNoneButton").addEventListener("click", () => { state.selected.clear(
 byId("connectButton").addEventListener("click", () => connectionAction("/api/connect"));
 byId("disconnectButton").addEventListener("click", () => connectionAction("/api/disconnect"));
 byId("stopButton").addEventListener("click", () => { stopJoystick(); sendCommand("stop", {}, true); });
+byId("joystickMode").addEventListener("change", () => {
+  stopJoystick();
+  updateJoystickModeNote();
+});
 document.querySelectorAll("[data-command]").forEach((button) => {
   button.addEventListener("click", () => { stopJoystick(); sendCommand(button.dataset.command); });
 });
 configureStick("left");
 configureStick("right", true);
+updateJoystickModeNote();
 window.addEventListener("blur", stopJoystick);
 document.addEventListener("visibilitychange", () => { if (document.hidden) stopJoystick(); });
 
