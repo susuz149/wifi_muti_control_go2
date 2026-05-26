@@ -1,4 +1,4 @@
-const state = { devices: [], selected: new Set(), profiles: {}, joystickInFlight: false };
+const state = { devices: [], selected: new Set(), profiles: {}, telemetry: [], mapPoints: [], videos: {}, joystickInFlight: false };
 const sticks = {
   left: { x: 0, y: 0, active: false },
   right: { x: 0, y: 0, active: false },
@@ -70,12 +70,13 @@ function renderDevices() {
     row.append(checkbox, number, information, statusPill);
     container.appendChild(row);
   });
-  container.querySelectorAll("input[type=checkbox]").forEach((checkbox) => {
-    checkbox.addEventListener("change", () => {
-      const number = Number(checkbox.dataset.number);
-      checkbox.checked ? state.selected.add(number) : state.selected.delete(number);
-    });
-  });
+	  container.querySelectorAll("input[type=checkbox]").forEach((checkbox) => {
+	    checkbox.addEventListener("change", () => {
+	      const number = Number(checkbox.dataset.number);
+	      checkbox.checked ? state.selected.add(number) : state.selected.delete(number);
+	      drawFormationPreview();
+	    });
+	  });
   byId("connectedCount").textContent = state.devices.filter((item) => item.connected).length;
 }
 
@@ -83,6 +84,162 @@ async function refresh() {
   const result = await api("/api/devices");
   state.devices = result.devices;
   renderDevices();
+}
+
+function poseText(pose) {
+  if (!pose) return "无";
+  return `x=${Number(pose.x).toFixed(2)}, y=${Number(pose.y).toFixed(2)}, yaw=${Number(pose.yaw).toFixed(2)}`;
+}
+
+function renderTelemetry() {
+  const container = byId("frameList");
+  if (!state.telemetry.length) {
+    container.className = "frame-list empty";
+    container.textContent = "连接机器人后显示各自 local/map pose 和 LiDAR 统计。";
+    return;
+  }
+  container.className = "frame-list";
+  container.innerHTML = "";
+  state.telemetry.forEach((robot) => {
+    const card = document.createElement("article");
+    card.className = `frame-card ${robot.aligned ? "aligned" : ""}`;
+    const title = document.createElement("div");
+    title.className = "frame-title";
+    title.innerHTML = `<strong>#${robot.number}</strong><span>${robot.ip}</span><b>${robot.aligned ? "已对齐 map" : "未标定"}</b>`;
+    const local = document.createElement("p");
+    local.textContent = `local(${robot.pose_topic || "rt/utlidar/robot_pose"}): ${poseText(robot.local_pose)}`;
+    const map = document.createElement("p");
+    map.textContent = `map: ${poseText(robot.map_pose)}`;
+    const lidar = robot.lidar || {};
+    const voxel = lidar.voxel || {};
+    const stateData = lidar.state || {};
+    const lidarLine = document.createElement("p");
+    lidarLine.textContent = `LiDAR(${lidar.voxel_topic || "rt/utlidar/voxel_map_compressed"}): points=${voxel.point_count || 0}, faces=${voxel.face_count || 0}, cloud_hz=${stateData.cloud_frequency ?? "?"}, dirty=${stateData.dirty_percentage ?? "?"}`;
+    const age = document.createElement("p");
+    age.textContent = `pose age=${robot.last_pose_age ?? "?"}s, seq=${robot.sequence}${robot.error ? `, error=${robot.error}` : ""}`;
+    card.append(title, local, map, lidarLine, age);
+    container.appendChild(card);
+  });
+}
+
+function drawSharedMap() {
+  const canvas = byId("sharedMapCanvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#17221f";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const robots = state.telemetry.filter((robot) => robot.map_pose);
+  const points = state.mapPoints || [];
+  const all = [
+    ...points.map((point) => ({ x: point.x, y: point.y })),
+    ...robots.map((robot) => ({ x: robot.map_pose.x, y: robot.map_pose.y })),
+  ];
+  if (!all.length) {
+    ctx.fillStyle = "#91a09a";
+    ctx.font = "18px sans-serif";
+    ctx.fillText("标定每台机器到 map frame 后，这里显示共同 LiDAR 扫描内容", 24, 44);
+    return;
+  }
+  const minX = Math.min(...all.map((item) => item.x));
+  const maxX = Math.max(...all.map((item) => item.x));
+  const minY = Math.min(...all.map((item) => item.y));
+  const maxY = Math.max(...all.map((item) => item.y));
+  const extent = Math.max(maxX - minX, maxY - minY, 2) * 1.2;
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  const scale = Math.min(canvas.width, canvas.height) / extent;
+  const toScreen = (x, y) => [
+    canvas.width / 2 + (y - centerY) * scale,
+    canvas.height / 2 - (x - centerX) * scale,
+  ];
+  ctx.strokeStyle = "#354542";
+  ctx.lineWidth = 1;
+  for (let x = 50; x < canvas.width; x += 50) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke(); }
+  for (let y = 50; y < canvas.height; y += 50) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); }
+  const colors = ["#2fe49d", "#ffd15c", "#62a8ff", "#ff7b92", "#d384ff", "#7be0e0"];
+  points.forEach((point) => {
+    const [x, y] = toScreen(point.x, point.y);
+    ctx.fillStyle = colors[(Number(point.number) - 1) % colors.length];
+    ctx.globalAlpha = 0.45;
+    ctx.fillRect(x, y, 2, 2);
+  });
+  ctx.globalAlpha = 1;
+  robots.forEach((robot) => {
+    const [x, y] = toScreen(robot.map_pose.x, robot.map_pose.y);
+    ctx.fillStyle = colors[(Number(robot.number) - 1) % colors.length];
+    ctx.beginPath();
+    ctx.arc(x, y, 10, 0, Math.PI * 2);
+    ctx.fill();
+    const yaw = robot.map_pose.yaw;
+    const [frontX, frontY] = toScreen(robot.map_pose.x + Math.cos(yaw) * 0.35, robot.map_pose.y + Math.sin(yaw) * 0.35);
+    ctx.strokeStyle = "#fffefa";
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(frontX, frontY);
+    ctx.stroke();
+    ctx.fillStyle = "#fffefa";
+    ctx.font = "bold 13px sans-serif";
+    ctx.fillText(`#${robot.number}`, x + 12, y - 10);
+  });
+}
+
+async function refreshSharedMap() {
+  try {
+    const result = await api("/api/map");
+    state.telemetry = result.robots;
+    state.mapPoints = result.points;
+    renderTelemetry();
+    drawSharedMap();
+  } catch (_error) {
+    drawSharedMap();
+  }
+}
+
+async function refreshTelemetry(quiet = true) {
+  try {
+    const result = await api("/api/telemetry");
+    state.telemetry = result.robots;
+    renderTelemetry();
+    drawSharedMap();
+  } catch (error) {
+    if (!quiet) setMessage(byId("frameMessage"), error.message, true);
+  }
+}
+
+async function alignFrame() {
+  try {
+    const result = await api("/api/frame/align", {
+      method: "POST",
+      body: JSON.stringify({
+        number: byId("alignNumber").value,
+        x: byId("alignX").value,
+        y: byId("alignY").value,
+        z: byId("alignZ").value,
+        yaw: byId("alignYaw").value,
+      }),
+    });
+    state.telemetry = result.robots;
+    renderTelemetry();
+    drawSharedMap();
+    setMessage(byId("frameMessage"), `#${result.frame.number} 已标定到 map frame。`);
+  } catch (error) {
+    setMessage(byId("frameMessage"), error.message, true);
+  }
+}
+
+async function clearAlignment() {
+  try {
+    const result = await api("/api/frame/clear", {
+      method: "POST",
+      body: JSON.stringify({ targets: selectedNumbers() }),
+    });
+    state.telemetry = result.robots;
+    renderTelemetry();
+    drawSharedMap();
+    setMessage(byId("frameMessage"), "已清除选中机器人的 map 对齐。");
+  } catch (error) {
+    setMessage(byId("frameMessage"), error.message, true);
+  }
 }
 
 async function scan() {
@@ -162,6 +319,172 @@ async function sendCommand(command, extra = {}, all = false, quiet = false) {
     }
   } catch (error) {
     setMessage(byId("controlMessage"), error.message, true);
+	  }
+	}
+
+function formationOffsets(numbers, pattern, spacing) {
+  const center = (numbers.length - 1) / 2;
+  const offsets = {};
+  if (pattern === "line") {
+    numbers.forEach((number, index) => { offsets[number] = { x: 0, y: (index - center) * spacing }; });
+  } else if (pattern === "column") {
+    numbers.forEach((number, index) => { offsets[number] = { x: -index * spacing, y: 0 }; });
+  } else if (pattern === "wedge") {
+    if (numbers.length) offsets[numbers[0]] = { x: 0, y: 0 };
+    numbers.slice(1).forEach((number, index) => {
+      const order = index + 1;
+      const side = order % 2 ? -1 : 1;
+      const row = Math.ceil(order / 2);
+      offsets[number] = { x: -row * spacing, y: side * row * spacing };
+    });
+  } else {
+    const columns = Math.max(1, Math.ceil(Math.sqrt(numbers.length)));
+    numbers.forEach((number, index) => {
+      const row = Math.floor(index / columns);
+      const column = index % columns;
+      const rowWidth = Math.min(columns, numbers.length - row * columns);
+      offsets[number] = { x: -row * spacing, y: (column - (rowWidth - 1) / 2) * spacing };
+    });
+  }
+  return offsets;
+}
+
+function drawFormationPreview() {
+  const canvas = byId("formationCanvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#17221f";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const numbers = selectedNumbers();
+  if (!numbers.length) {
+    ctx.fillStyle = "#91a09a";
+    ctx.font = "16px sans-serif";
+    ctx.fillText("选择至少两台机器人后预览队形", 24, 42);
+    return;
+  }
+  const spacing = Number(byId("formationSpacing").value || 0.8);
+  const offsets = formationOffsets(numbers, byId("formationPattern").value, spacing);
+  const points = Object.values(offsets);
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const minX = Math.min(...xs, -1);
+  const maxX = Math.max(...xs, 1);
+  const minY = Math.min(...ys, -1);
+  const maxY = Math.max(...ys, 1);
+  const extent = Math.max(maxX - minX, maxY - minY, 1.5) * 1.35;
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  const scale = Math.min(canvas.width, canvas.height) / extent;
+  const toScreen = (point) => [
+    canvas.width / 2 + (point.y - centerY) * scale,
+    canvas.height / 2 - (point.x - centerX) * scale,
+  ];
+  ctx.strokeStyle = "#354542";
+  ctx.lineWidth = 1;
+  for (let x = 40; x < canvas.width; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke(); }
+  for (let y = 40; y < canvas.height; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); }
+  numbers.forEach((number) => {
+    const point = offsets[number];
+    const [x, y] = toScreen(point);
+    ctx.fillStyle = number === numbers[0] ? "#2fe49d" : "#ffd15c";
+    ctx.beginPath();
+    ctx.arc(x, y, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#17221f";
+    ctx.font = "bold 13px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(`#${number}`, x, y);
+  });
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "#b6c5bf";
+  ctx.font = "12px sans-serif";
+  ctx.fillText("上方为前进方向，#1 为参考点", 14, canvas.height - 14);
+}
+
+async function runFormation() {
+  const targets = selectedNumbers();
+  if (targets.length < 2) {
+    setMessage(byId("formationMessage"), "自动列队至少需要选择两台机器人。", true);
+    return;
+  }
+  if (!byId("confirmMotion").checked || !byId("confirmFormation").checked) {
+    setMessage(byId("formationMessage"), "需要同时勾选真机动作确认和列队区域确认。", true);
+    return;
+  }
+  if (!window.confirm(`确认对 ${targets.join(", ")} 执行闭环自动列队？请确认每台已完成 map frame 标定，区域必须空旷。`)) return;
+  try {
+    const result = await api("/api/formation", {
+      method: "POST",
+      body: JSON.stringify({
+        targets,
+        confirm_motion: byId("confirmMotion").checked,
+        confirm_formation: byId("confirmFormation").checked,
+        pattern: byId("formationPattern").value,
+        spacing: byId("formationSpacing").value,
+        formation_speed: byId("formationSpeed").value,
+        timeout: byId("formationTimeout").value,
+        yaw_rate: byId("yawRate").value,
+      }),
+    });
+    state.devices = result.devices;
+    renderDevices();
+    const failures = result.results.filter((item) => !item.ok);
+    setMessage(byId("formationMessage"), failures.length ? failures.map((item) => `#${item.number}: ${item.error}`).join("; ") : "自动列队完成。", failures.length > 0);
+  } catch (error) {
+    setMessage(byId("formationMessage"), error.message, true);
+  }
+}
+
+function renderVideos() {
+  const container = byId("videoList");
+  const entries = state.devices.filter((device) => device.connected);
+  if (!entries.length) {
+    container.className = "video-list empty";
+    container.textContent = "连接并开启视频后显示画面。";
+    return;
+  }
+  container.className = "video-list";
+  container.innerHTML = "";
+  entries.forEach((device) => {
+    const video = state.videos[String(device.number)] || {};
+    const card = document.createElement("article");
+    card.className = "video-card";
+    const title = document.createElement("div");
+    title.className = "video-title";
+    title.innerHTML = `<strong>#${device.number}</strong><span>${device.ip}</span><b>${video.enabled ? "视频开启" : "视频关闭"}</b>`;
+    const img = document.createElement("img");
+    img.alt = `Go2 #${device.number} video`;
+    img.src = video.enabled ? `/api/video/frame/${device.number}?t=${Date.now()}` : "";
+    const detail = document.createElement("p");
+    detail.textContent = video.enabled
+      ? `frames=${video.frames || 0}, age=${video.age ?? "?"}s, ${video.width || 0}x${video.height || 0}${video.error ? `, error=${video.error}` : ""}`
+      : "未开启";
+    card.append(title, img, detail);
+    container.appendChild(card);
+  });
+}
+
+async function refreshVideos() {
+  try {
+    const result = await api("/api/video/status");
+    state.videos = result.videos;
+    renderVideos();
+  } catch (_error) {}
+}
+
+async function setVideo(enabled) {
+  try {
+    const result = await api("/api/video", {
+      method: "POST",
+      body: JSON.stringify({ targets: selectedNumbers(), enabled }),
+    });
+    state.videos = result.videos;
+    renderVideos();
+    setMessage(byId("videoMessage"), enabled ? "已开启选中视频。" : "已关闭选中视频。");
+  } catch (error) {
+    setMessage(byId("videoMessage"), error.message, true);
   }
 }
 
@@ -298,8 +621,8 @@ function showVelocity(velocity) {
 function updateJoystickModeNote() {
   const mode = byId("joystickMode").value;
   byId("joystickModeNote").textContent = mode === "wireless"
-    ? "当前使用无线遥控器输入：Go2 避障服务会过滤摇杆运动。释放摇杆或窗口失焦立即停止。"
-    : "当前使用 Sport Move：会绕开避障过滤，只在完全安全、需要直接控制时使用。释放摇杆或窗口失焦立即停止。";
+    ? "当前使用无线遥控器输入：机载自由避障会参与过滤。释放摇杆或窗口失焦立即停止。"
+    : "当前使用 Sport Move：直接发送速度命令，闭环控制器也使用此通道。只在区域安全时使用。";
   byId("joystickModeNote").style.color = mode === "wireless" ? "" : "#ffb4a9";
 }
 
@@ -381,14 +704,24 @@ function configureStick(name, lockVertical = false) {
 byId("scanButton").addEventListener("click", scan);
 byId("addButton").addEventListener("click", addManual);
 byId("manualIp").addEventListener("keydown", (event) => { if (event.key === "Enter") addManual(); });
-byId("selectAllButton").addEventListener("click", () => { state.devices.forEach((device) => state.selected.add(device.number)); renderDevices(); });
-byId("selectNoneButton").addEventListener("click", () => { state.selected.clear(); renderDevices(); });
+byId("selectAllButton").addEventListener("click", () => { state.devices.forEach((device) => state.selected.add(device.number)); renderDevices(); drawFormationPreview(); });
+byId("selectNoneButton").addEventListener("click", () => { state.selected.clear(); renderDevices(); drawFormationPreview(); });
 byId("connectButton").addEventListener("click", () => connectionAction("/api/connect"));
 byId("disconnectButton").addEventListener("click", () => connectionAction("/api/disconnect"));
+byId("refreshTelemetryButton").addEventListener("click", () => refreshTelemetry(false));
+byId("alignButton").addEventListener("click", alignFrame);
+byId("clearAlignButton").addEventListener("click", clearAlignment);
+byId("videoOnButton").addEventListener("click", () => setVideo(true));
+byId("videoOffButton").addEventListener("click", () => setVideo(false));
 byId("stopButton").addEventListener("click", () => { stopJoystick(); sendCommand("stop", {}, true); });
 byId("joystickMode").addEventListener("change", () => {
   stopJoystick();
   updateJoystickModeNote();
+});
+byId("formationButton").addEventListener("click", () => { stopJoystick(); runFormation(); });
+[byId("formationPattern"), byId("formationSpacing"), byId("formationSpeed"), byId("formationTimeout")].forEach((element) => {
+  element.addEventListener("input", drawFormationPreview);
+  element.addEventListener("change", drawFormationPreview);
 });
 document.querySelectorAll("[data-command]").forEach((button) => {
   button.addEventListener("click", () => { stopJoystick(); sendCommand(button.dataset.command); });
@@ -400,5 +733,13 @@ window.addEventListener("blur", stopJoystick);
 document.addEventListener("visibilitychange", () => { if (document.hidden) stopJoystick(); });
 
 refresh().catch((error) => setMessage(byId("scanMessage"), error.message, true));
+refreshTelemetry().catch(() => {});
+refreshSharedMap().catch(() => {});
+refreshVideos().catch(() => {});
 loadCatalog().catch((error) => setMessage(byId("controlMessage"), error.message, true));
+drawFormationPreview();
+drawSharedMap();
 setInterval(() => refresh().catch(() => {}), 2000);
+setInterval(() => refreshTelemetry().catch(() => {}), 1000);
+setInterval(() => refreshSharedMap().catch(() => {}), 1200);
+setInterval(() => refreshVideos().catch(() => {}), 1000);

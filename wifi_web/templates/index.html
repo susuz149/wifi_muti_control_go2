@@ -64,10 +64,10 @@
           <label>平移速度 m/s <input id="speed" type="number" min="0.01" max="0.5" step="0.01" value="0.15"></label>
           <label>转速 rad/s <input id="yawRate" type="number" min="0.01" max="1" step="0.01" value="0.35"></label>
           <label>脉冲时长 s <input id="duration" type="number" min="0.05" max="1" step="0.05" value="0.25"></label>
-          <label>摇杆通道
+          <label>手控通道
             <select id="joystickMode">
-              <option value="wireless">无线遥控器输入（默认，走避障）</option>
-              <option value="sport">Sport Move（绕开避障过滤）</option>
+              <option value="wireless">无线遥控器输入（默认，走机载避障）</option>
+              <option value="sport">Sport Move（直接速度命令）</option>
             </select>
           </label>
         </div>
@@ -103,6 +103,80 @@
           <p id="joystickModeNote" class="message deadman">拖动期间持续发指令；释放摇杆或窗口失焦立即发送停止。</p>
         </div>
         <p id="controlMessage" class="message"></p>
+      </section>
+
+      <section class="panel frame-panel">
+        <div class="panel-title">
+          <div>
+            <h2>坐标系对齐与 LiDAR 隔离</h2>
+            <p class="message">每台机器只使用自己的 `rt/utlidar/*` 回调；先逐台标定当前 local pose 在 map 中的位置，再生成统一 map frame。</p>
+          </div>
+          <button id="refreshTelemetryButton">刷新状态</button>
+        </div>
+        <div class="frame-settings">
+          <label>编号 <input id="alignNumber" type="number" min="1" step="1" value="1"></label>
+          <label>map x <input id="alignX" type="number" step="0.05" value="0"></label>
+          <label>map y <input id="alignY" type="number" step="0.05" value="0"></label>
+          <label>map z <input id="alignZ" type="number" step="0.05" value="0"></label>
+          <label>map yaw(rad) <input id="alignYaw" type="number" step="0.01" value="0"></label>
+          <button id="alignButton" class="primary">标定该编号</button>
+          <button id="clearAlignButton">清除选中标定</button>
+        </div>
+        <div id="frameList" class="frame-list empty">连接机器人后显示各自 local/map pose 和 LiDAR 统计。</div>
+        <div class="shared-map">
+          <canvas id="sharedMapCanvas" width="1000" height="420"></canvas>
+          <p class="message">共同 LiDAR 图只显示已标定到 map frame 的机器；颜色按机器人编号区分。</p>
+        </div>
+        <p id="frameMessage" class="message"></p>
+      </section>
+
+      <section class="panel video-panel">
+        <div class="panel-title">
+          <div>
+            <h2>单机视频</h2>
+            <p class="message">视频按编号单独开启；每个画面只读取该编号对应的 WebRTC video track。</p>
+          </div>
+          <div class="actions">
+            <button id="videoOnButton" class="primary">开启选中视频</button>
+            <button id="videoOffButton">关闭选中视频</button>
+          </div>
+        </div>
+        <div id="videoList" class="video-list empty">连接并开启视频后显示画面。</div>
+        <p id="videoMessage" class="message"></p>
+      </section>
+
+      <section class="panel formation-panel">
+        <div class="panel-title">
+          <div>
+            <h2>自动列队</h2>
+            <p class="message">对当前勾选的已连接机器人按编号分配队形位置；需要先完成 map frame 标定，执行时按实时 map_pose 闭环修正。</p>
+          </div>
+          <button id="formationButton" class="primary">执行列队</button>
+        </div>
+
+        <div class="safety formation-safety">
+          <label><input id="confirmFormation" type="checkbox"> 已确认队形区域空旷且坐标已标定，允许执行闭环列队</label>
+        </div>
+
+        <div class="settings formation-settings">
+          <label>队形
+            <select id="formationPattern">
+              <option value="line">横队</option>
+              <option value="column">纵队</option>
+              <option value="wedge">楔形</option>
+              <option value="grid">方阵</option>
+            </select>
+          </label>
+          <label>间距 m <input id="formationSpacing" type="number" min="0.3" max="2" step="0.1" value="0.8"></label>
+          <label>列队速度 m/s <input id="formationSpeed" type="number" min="0.03" max="0.25" step="0.01" value="0.12"></label>
+          <label>超时 s <input id="formationTimeout" type="number" min="5" max="60" step="1" value="25"></label>
+        </div>
+
+        <div class="formation-preview">
+          <canvas id="formationCanvas" width="620" height="300"></canvas>
+          <p class="message">选中编号最小者作为队形参考点；目标点在 map frame 中生成，每台机器用自己的 map_pose 闭环靠近目标。</p>
+        </div>
+        <p id="formationMessage" class="message"></p>
       </section>
 
       <section class="panel sdk-panel">

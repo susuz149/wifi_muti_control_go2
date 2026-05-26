@@ -26,6 +26,10 @@ This project uses `unitree_webrtc_connect` over LocalSTA WebRTC data channels. I
   - MCF profile for firmware modes using MCF API IDs.
   - High-risk actions such as flips, handstand/upright modes, jumps, and motor damping require extra confirmation.
 - Go2 Air audio is disabled in the WebRTC driver path.
+- Per-robot telemetry isolation for `rt/utlidar/robot_pose`, LiDAR state, and compressed voxel maps.
+- Explicit local-to-`map` alignment per robot, with a color-coded shared LiDAR map.
+- Closed-loop formation placement using each robot's aligned `map_pose`.
+- Per-robot WebRTC camera display in the browser.
 
 ## Quick Start
 
@@ -66,6 +70,8 @@ The UI deliberately blocks normal motion until the safety checkbox is enabled. H
 - Known Go2 LocalSTA signaling ports checked by scanner: `9991` and `8081`.
 - After connection, the app calls `rt/api/obstacles_avoid/request` with `SWITCH_SET {"enable": true}` and verifies the state with `SWITCH_GET`.
 - Default joystick channel is `rt/wirelesscontroller`. The UI can switch to `rt/api/sport/request` `Move` for direct control.
+- Closed-loop formation uses direct velocity commands and currently does not constitute a full multi-robot path planner; run it only in a verified clear area.
+- `ARCHITECTURE_CN.md` documents the intended split for future shared-map localization, automatic planning, and swappable formation algorithms.
 - For Go2 firmware `>= 1.1.15`, Unitree LAN signaling may require a per-device AES key. This project is currently scoped for firmware `< 1.1.15`.
 
 ---
@@ -100,6 +106,10 @@ The UI deliberately blocks normal motion until the safety checkbox is enabled. H
   - `MCF (firmware >= 1.1.7)`
   - 空翻、倒立/直立、跳跃、卸力等高风险动作需要额外确认。
 - Go2 Air 没有音频，本项目已禁用音频通道。
+- 按机器人编号/IP 隔离 `rt/utlidar/robot_pose`、LiDAR 状态和压缩 voxel 数据。
+- 支持逐台设置 `T_map_local`，将多台扫描内容显示在共同 `map frame` 中。
+- 支持基于每台实时 `map_pose` 的闭环列队。
+- 支持网页按编号打开每台 Go2 的视频。
 
 ## 快速安装
 

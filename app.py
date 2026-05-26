@@ -6,6 +6,7 @@ import asyncio
 import atexit
 import ipaddress
 import json
+import math
 import random
 import sys
 import threading
@@ -13,7 +14,10 @@ import time
 import types
 from dataclasses import dataclass, field
 
+import cv2
+import numpy as np
 from flask import Flask, jsonify, render_template, request
+from flask import Response
 
 # Audio is neither available nor needed on Go2 Air. Avoid sound-device
 # enumeration when importing the installed driver.
@@ -28,6 +32,19 @@ MAX_SPEED = 0.5
 MAX_YAW_RATE = 1.0
 MAX_DURATION = 1.0
 CONTROL_COMMANDS = {"stop", "move", "joystick", "sport_action"}
+FORMATION_PATTERNS = {"line", "column", "wedge", "grid"}
+MAX_FORMATION_SPACING = 2.0
+MAX_FORMATION_SPEED = 0.25
+MAX_FORMATION_DISTANCE = 4.0
+CLOSED_LOOP_POSITION_TOLERANCE = 0.12
+CLOSED_LOOP_YAW_TOLERANCE = 0.18
+CLOSED_LOOP_TIMEOUT = 25.0
+LIDAR_MAP_POINT_LIMIT = 2400
+TELEMETRY_TOPICS = {
+    "pose": RTC_TOPIC["ROBOTODOM"],
+    "lidar_state": RTC_TOPIC["ULIDAR_STATE"],
+    "lidar_voxel": RTC_TOPIC["ULIDAR_ARRAY"],
+}
 
 
 def action(label, category, parameter="none", risk="normal", enabled=True, note=""):
@@ -205,6 +222,61 @@ class Device:
         }
 
 
+@dataclass
+class FrameState:
+    local_pose: dict | None = None
+    map_pose: dict | None = None
+    map_to_local: dict | None = None
+    aligned: bool = False
+    anchor: dict | None = None
+    last_pose_time: float = 0.0
+    pose_topic: str = ""
+    lidar: dict = field(default_factory=dict)
+    map_points: list = field(default_factory=list)
+    sequence: int = 0
+    error: str = ""
+
+    def payload(self, number, device):
+        return {
+            "number": number,
+            "ip": device.ip,
+            "sn": device.sn,
+            "connected": device.connected,
+            "aligned": self.aligned,
+            "local_pose": self.local_pose,
+            "map_pose": self.map_pose,
+            "map_to_local": self.map_to_local,
+            "anchor": self.anchor,
+            "last_pose_age": round(time.time() - self.last_pose_time, 3) if self.last_pose_time else None,
+            "pose_topic": self.pose_topic,
+            "lidar": self.lidar,
+            "map_points": self.map_points,
+            "sequence": self.sequence,
+            "error": self.error,
+        }
+
+
+@dataclass
+class VideoState:
+    enabled: bool = False
+    frame: bytes | None = None
+    frame_time: float = 0.0
+    width: int = 0
+    height: int = 0
+    frames: int = 0
+    error: str = ""
+
+    def payload(self):
+        return {
+            "enabled": self.enabled,
+            "age": round(time.time() - self.frame_time, 3) if self.frame_time else None,
+            "width": self.width,
+            "height": self.height,
+            "frames": self.frames,
+            "error": self.error,
+        }
+
+
 class MultiGo2Service:
     def __init__(self):
         self.lock = threading.Lock()
@@ -212,6 +284,8 @@ class MultiGo2Service:
         self.next_number = 1
         self.connections = {}
         self.joystick_deadmen = {}
+        self.frames = {}
+        self.videos = {}
         self.loop = None
         self.closed = False
         self.ready = threading.Event()
@@ -260,6 +334,8 @@ class MultiGo2Service:
                 return existing.payload()
             device = Device(number=self.next_number, ip=ip, sn=sn, source=source)
             self.devices[device.number] = device
+            self.frames[device.number] = FrameState()
+            self.videos[device.number] = VideoState()
             self.next_number += 1
             return device.payload()
 
@@ -328,6 +404,13 @@ class MultiGo2Service:
         try:
             await asyncio.wait_for(conn.connect(), timeout=20.0)
             self.connections[device.number] = conn
+            await conn.datachannel.disableTrafficSaving(True)
+            self.frames.setdefault(device.number, FrameState())
+            self.videos.setdefault(device.number, VideoState())
+            conn.video.add_track_callback(
+                lambda track, number=device.number: self._video_track_reader(number, track)
+            )
+            self._subscribe_telemetry(device.number, conn)
             avoid_enabled = await self._enable_obstacle_avoid(conn)
             self.set_status(
                 device.number,
@@ -338,11 +421,15 @@ class MultiGo2Service:
             )
             return {"number": device.number, "ok": True, "avoid_enabled": avoid_enabled}
         except Exception as exc:
+            self.connections.pop(device.number, None)
             try:
+                await conn.datachannel.disableTrafficSaving(False)
                 await conn.disconnect()
             except Exception:
                 pass
-            self.set_status(device.number, connected=False, avoid_enabled=False, busy=False, error=str(exc))
+            self.set_status(
+                device.number, connected=False, avoid_enabled=False, busy=False, error=str(exc)
+            )
             return {"number": device.number, "ok": False, "error": str(exc)}
 
     async def disconnect(self, numbers):
@@ -357,12 +444,127 @@ class MultiGo2Service:
         conn = self.connections.pop(number, None)
         if conn:
             try:
+                self._unsubscribe_telemetry(conn)
+                conn.datachannel.switchVideoChannel(False)
+                await conn.datachannel.disableTrafficSaving(False)
                 await conn.disconnect()
             except Exception as exc:
                 self.set_status(number, connected=False, error=str(exc))
                 return {"number": number, "ok": False, "error": str(exc)}
         self.set_status(number, connected=False, avoid_enabled=False, error="")
+        with self.lock:
+            video = self.videos.setdefault(number, VideoState())
+            video.enabled = False
         return {"number": number, "ok": True}
+
+    def _subscribe_telemetry(self, number, conn):
+        for name, topic in TELEMETRY_TOPICS.items():
+            def callback(message, number=number, topic=topic):
+                self._telemetry_callback(number, topic, message)
+
+            conn.datachannel.pub_sub.subscribe(topic, callback)
+
+    @staticmethod
+    def _unsubscribe_telemetry(conn):
+        for topic in TELEMETRY_TOPICS.values():
+            try:
+                conn.datachannel.pub_sub.unsubscribe(topic)
+            except Exception:
+                pass
+
+    def _telemetry_callback(self, number, topic, message):
+        with self.lock:
+            device = self.devices.get(number)
+            frame = self.frames.setdefault(number, FrameState())
+            if not device:
+                return
+            if number not in self.connections:
+                return
+            received_topic = message.get("topic") if isinstance(message, dict) else None
+            if received_topic and received_topic != topic:
+                frame.error = f"topic mismatch: expected {topic}, got {received_topic}"
+                return
+            try:
+                if topic == RTC_TOPIC["ROBOTODOM"]:
+                    local_pose = extract_pose(message)
+                    if not local_pose:
+                        frame.error = "无法解析 rt/utlidar/robot_pose"
+                        return
+                    frame.local_pose = local_pose
+                    frame.map_pose = transform_pose(frame.map_to_local, local_pose)
+                    frame.last_pose_time = time.time()
+                    frame.pose_topic = topic
+                    frame.sequence += 1
+                    frame.error = ""
+                elif topic == RTC_TOPIC["ULIDAR_STATE"]:
+                    frame.lidar["state"] = compact_lidar_state(message)
+                    frame.lidar["state_topic"] = topic
+                    frame.lidar["state_time"] = time.time()
+                elif topic == RTC_TOPIC["ULIDAR_ARRAY"]:
+                    frame.lidar["voxel"] = compact_voxel_stats(message)
+                    frame.lidar["voxel_topic"] = topic
+                    frame.lidar["voxel_time"] = time.time()
+                    frame.map_points = voxel_map_points(message, frame.map_to_local)
+            except Exception as exc:
+                frame.error = str(exc)
+
+    def telemetry_payload(self):
+        with self.lock:
+            return [
+                self.frames.setdefault(number, FrameState()).payload(number, self.devices[number])
+                for number in sorted(self.devices)
+            ]
+
+    def map_payload(self):
+        with self.lock:
+            robots = []
+            points = []
+            for number in sorted(self.devices):
+                frame = self.frames.setdefault(number, FrameState())
+                robot = frame.payload(number, self.devices[number])
+                robot.pop("map_points", None)
+                robots.append(robot)
+                for point in frame.map_points:
+                    points.append({"number": number, "ip": self.devices[number].ip, **point})
+            return {"robots": robots, "points": points}
+
+    def align_robot(self, number, map_pose):
+        with self.lock:
+            if number not in self.devices:
+                raise ValueError(f"不存在的编号: {number}")
+            frame = self.frames.setdefault(number, FrameState())
+            if not frame.local_pose:
+                raise ValueError(f"#{number} 还没有收到 rt/utlidar/robot_pose，不能标定")
+            frame.map_to_local = compute_map_to_local(map_pose, frame.local_pose)
+            frame.anchor = dict(map_pose)
+            frame.aligned = True
+            frame.map_pose = transform_pose(frame.map_to_local, frame.local_pose)
+            frame.map_points = []
+            frame.error = ""
+            return frame.payload(number, self.devices[number])
+
+    def clear_alignment(self, numbers):
+        self.require_devices(numbers)
+        with self.lock:
+            for number in numbers:
+                frame = self.frames.setdefault(number, FrameState())
+                frame.map_to_local = None
+                frame.anchor = None
+                frame.aligned = False
+                frame.map_pose = None
+                frame.map_points = []
+            return [
+                self.frames.setdefault(number, FrameState()).payload(number, self.devices[number])
+                for number in sorted(self.devices)
+            ]
+
+    def current_map_pose(self, number):
+        frame = self.frames.get(number)
+        if not frame or not frame.map_pose:
+            return None
+        if not frame.last_pose_time or time.time() - frame.last_pose_time > 1.0:
+            return None
+        return dict(frame.map_pose)
 
     def connected_connections(self, numbers):
         self.require_devices(numbers)
@@ -377,6 +579,78 @@ class MultiGo2Service:
             *(self._command_one(number, conn, name, parameters) for number, conn in connections)
         )
         return results
+
+    async def formation(self, numbers, parameters):
+        connections = self.connected_connections(numbers)
+        ordered_numbers = sorted(numbers)
+        offsets = formation_offsets(ordered_numbers, parameters["pattern"], parameters["spacing"])
+        leader_number = ordered_numbers[0]
+        leader_pose = self.current_map_pose(leader_number)
+        if not leader_pose:
+            raise ValueError(f"#{leader_number} 没有可用 map_pose，请先完成坐标标定并确认 pose 正在更新")
+        with self.lock:
+            not_aligned = [
+                number
+                for number in ordered_numbers
+                if not self.frames.get(number) or not self.frames[number].aligned
+            ]
+        if not_aligned:
+            raise ValueError(f"以下 Go2 尚未对齐到 map frame: {not_aligned}")
+
+        targets = {}
+        for number, offset in offsets.items():
+            dx, dy = rotate_xy(offset["x"], offset["y"], leader_pose["yaw"])
+            targets[number] = {
+                "x": leader_pose["x"] + dx,
+                "y": leader_pose["y"] + dy,
+                "z": leader_pose.get("z", 0.0),
+                "yaw": leader_pose["yaw"],
+            }
+
+        return await asyncio.gather(
+            *(
+                self._closed_loop_to_target(number, conn, targets[number], parameters)
+                for number, conn in connections
+            )
+        )
+
+    async def _closed_loop_to_target(self, number, conn, target, parameters):
+        deadline = time.monotonic() + parameters["timeout"]
+        last_error = None
+        try:
+            while time.monotonic() < deadline:
+                pose = self.current_map_pose(number)
+                if not pose:
+                    raise RuntimeError("map_pose 不可用或已超时")
+                dx = target["x"] - pose["x"]
+                dy = target["y"] - pose["y"]
+                distance = math.hypot(dx, dy)
+                yaw_error = normalize_angle(target["yaw"] - pose["yaw"])
+                last_error = {"distance": round(distance, 3), "yaw": round(yaw_error, 3)}
+                if (
+                    distance <= parameters["position_tolerance"]
+                    and abs(yaw_error) <= parameters["yaw_tolerance"]
+                ):
+                    await self._sport_request(conn, SPORT_CMD["StopMove"])
+                    return {"number": number, "ok": True, "target": target, "error": last_error}
+
+                local_x, local_y = rotate_xy(dx, dy, -pose["yaw"])
+                scale = min(parameters["speed"] / max(distance, 0.001), 1.0)
+                vx = clamp(local_x * scale, -parameters["speed"], parameters["speed"])
+                vy = clamp(local_y * scale, -parameters["speed"], parameters["speed"])
+                wz = clamp(yaw_error * 0.8, -parameters["yaw_rate"], parameters["yaw_rate"])
+                self._move_without_reply(conn, vx, vy, wz)
+                await asyncio.sleep(0.12)
+
+            await self._sport_request(conn, SPORT_CMD["StopMove"])
+            return {"number": number, "ok": False, "error": f"闭环列队超时: {last_error}", "target": target}
+        except Exception as exc:
+            try:
+                await self._sport_request(conn, SPORT_CMD["StopMove"])
+            except Exception:
+                pass
+            self.set_status(number, error=str(exc))
+            return {"number": number, "ok": False, "error": str(exc), "target": target}
 
     async def _command_one(self, number, conn, name, parameters):
         try:
@@ -472,8 +746,6 @@ class MultiGo2Service:
             await asyncio.sleep(0.2)
         code, enabled = await self._query_obstacle_avoid(conn)
         if enabled is not True:
-            # Some firmware versions expose MCF FreeAvoid in addition to the
-            # obstacle-avoid service. Enabling both keeps the browser default conservative.
             await self._sport_request(conn, SPORT_CMD_MCF["FreeAvoid"], {"data": True})
             code, enabled = await self._query_obstacle_avoid(conn)
         if enabled is not True:
@@ -502,6 +774,47 @@ class MultiGo2Service:
                 enabled = None
         return code, enabled
 
+    async def video(self, numbers, enabled):
+        connections = self.connected_connections(numbers)
+        for number, conn in connections:
+            conn.datachannel.switchVideoChannel(enabled)
+            with self.lock:
+                video = self.videos.setdefault(number, VideoState())
+                video.enabled = enabled
+                video.error = ""
+        return [{"number": number, "ok": True, "enabled": enabled} for number, _conn in connections]
+
+    async def _video_track_reader(self, number, track):
+        while True:
+            try:
+                frame = await track.recv()
+                image = frame.to_ndarray(format="bgr24")
+                ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                if not ok:
+                    continue
+                with self.lock:
+                    video = self.videos.setdefault(number, VideoState())
+                    video.frame = encoded.tobytes()
+                    video.frame_time = time.time()
+                    video.height, video.width = image.shape[:2]
+                    video.frames += 1
+                    video.error = ""
+            except Exception as exc:
+                with self.lock:
+                    self.videos.setdefault(number, VideoState()).error = str(exc)
+                return
+
+    def video_payload(self):
+        with self.lock:
+            return {
+                str(number): self.videos.setdefault(number, VideoState()).payload()
+                for number in sorted(self.devices)
+            }
+
+    def video_frame(self, number):
+        with self.lock:
+            return self.videos.setdefault(number, VideoState()).frame
+
     async def stop_and_disconnect_all(self):
         numbers = list(self.connections)
         if numbers:
@@ -528,6 +841,178 @@ atexit.register(service.close)
 
 def payload_error(message, status=400):
     return jsonify({"ok": False, "error": message}), status
+
+
+def nested(value, *keys):
+    current = value
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def numeric(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def yaw_from_quaternion(value):
+    if not isinstance(value, dict):
+        return 0.0
+    x = numeric(value.get("x"))
+    y = numeric(value.get("y"))
+    z = numeric(value.get("z"))
+    w = numeric(value.get("w"), 1.0)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def normalize_angle(angle):
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def rotate_xy(x, y, yaw):
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    return cos_yaw * x - sin_yaw * y, sin_yaw * x + cos_yaw * y
+
+
+def extract_position(pose):
+    if not isinstance(pose, dict):
+        return None
+    position = pose.get("position") or pose.get("translation") or pose.get("pos")
+    if isinstance(position, dict):
+        return {
+            "x": numeric(position.get("x")),
+            "y": numeric(position.get("y")),
+            "z": numeric(position.get("z")),
+        }
+    if all(key in pose for key in ("x", "y")):
+        return {"x": numeric(pose.get("x")), "y": numeric(pose.get("y")), "z": numeric(pose.get("z"))}
+    return None
+
+
+def extract_pose(message):
+    pose = nested(message, "data", "pose") or nested(message, "data", "data", "pose")
+    if not isinstance(pose, dict):
+        return None
+    position = extract_position(pose)
+    if not position:
+        return None
+    orientation = pose.get("orientation") or pose.get("rotation") or pose.get("quat") or {}
+    yaw = numeric(pose.get("yaw"), yaw_from_quaternion(orientation))
+    return {
+        "x": round(position["x"], 4),
+        "y": round(position["y"], 4),
+        "z": round(position["z"], 4),
+        "yaw": round(normalize_angle(yaw), 5),
+    }
+
+
+def transform_pose(transform, local_pose):
+    if not transform or not local_pose:
+        return None
+    yaw = numeric(transform.get("yaw"))
+    rotated_x, rotated_y = rotate_xy(local_pose["x"], local_pose["y"], yaw)
+    x = rotated_x + transform["x"]
+    y = rotated_y + transform["y"]
+    return {
+        "x": round(x, 4),
+        "y": round(y, 4),
+        "z": round(local_pose.get("z", 0.0) + transform.get("z", 0.0), 4),
+        "yaw": round(normalize_angle(local_pose.get("yaw", 0.0) + yaw), 5),
+    }
+
+
+def compute_map_to_local(map_pose, local_pose):
+    yaw = normalize_angle(map_pose["yaw"] - local_pose["yaw"])
+    rotated_local_x, rotated_local_y = rotate_xy(local_pose["x"], local_pose["y"], yaw)
+    return {
+        "x": round(map_pose["x"] - rotated_local_x, 4),
+        "y": round(map_pose["y"] - rotated_local_y, 4),
+        "z": round(map_pose.get("z", 0.0) - local_pose.get("z", 0.0), 4),
+        "yaw": round(yaw, 5),
+    }
+
+
+def compact_lidar_state(message):
+    data = message.get("data", {}) if isinstance(message, dict) else {}
+    keys = [
+        "cloud_frequency",
+        "cloud_packet_loss_rate",
+        "cloud_scan_num",
+        "cloud_size",
+        "dirty_percentage",
+        "error_state",
+        "firmware_version",
+        "imu_frequency",
+        "imu_packet_loss_rate",
+        "sdk_version",
+    ]
+    return {key: data.get(key) for key in keys if key in data}
+
+
+def compact_voxel_stats(message):
+    payload = nested(message, "data", "data")
+    if isinstance(payload, dict):
+        return {
+            "point_count": int(payload.get("point_count") or 0),
+            "face_count": int(payload.get("face_count") or 0),
+            "positions_bytes": int(getattr(payload.get("positions"), "nbytes", 0) or 0),
+            "uvs_bytes": int(getattr(payload.get("uvs"), "nbytes", 0) or 0),
+            "indices_bytes": int(getattr(payload.get("indices"), "nbytes", 0) or 0),
+        }
+    return {"raw_type": type(payload).__name__}
+
+
+def voxel_map_points(message, transform):
+    if not transform:
+        return []
+    payload = nested(message, "data", "data")
+    if not isinstance(payload, dict):
+        return []
+    positions = payload.get("positions")
+    if positions is None:
+        return []
+    try:
+        raw = positions.tobytes() if hasattr(positions, "tobytes") else bytes(positions)
+        floats = np.frombuffer(raw, dtype=np.float32)
+        usable = (floats.size // 3) * 3
+        if usable <= 0:
+            return []
+        points = floats[:usable].reshape((-1, 3))
+        if len(points) > LIDAR_MAP_POINT_LIMIT:
+            step = max(1, len(points) // LIDAR_MAP_POINT_LIMIT)
+            points = points[::step]
+        mapped = []
+        for x, y, z in points:
+            if not np.isfinite(x) or not np.isfinite(y) or not np.isfinite(z):
+                continue
+            if abs(float(x)) > 80.0 or abs(float(y)) > 80.0 or abs(float(z)) > 10.0:
+                continue
+            map_x, map_y = rotate_xy(float(x), float(y), transform["yaw"])
+            mapped.append(
+                {
+                    "x": round(map_x + transform["x"], 3),
+                    "y": round(map_y + transform["y"], 3),
+                    "z": round(float(z) + transform.get("z", 0.0), 3),
+                }
+            )
+        return mapped[:LIDAR_MAP_POINT_LIMIT]
+    except Exception:
+        return []
 
 
 def parse_numbers(data):
@@ -590,6 +1075,77 @@ def movement_parameters(data):
     return {"x": x, "y": y, "z": z, "duration": duration}
 
 
+def formation_offsets(numbers, pattern, spacing):
+    count = len(numbers)
+    center = (count - 1) / 2.0
+    offsets = {}
+    if pattern == "line":
+        for index, number in enumerate(numbers):
+            offsets[number] = {"x": 0.0, "y": (index - center) * spacing}
+    elif pattern == "column":
+        for index, number in enumerate(numbers):
+            offsets[number] = {"x": -index * spacing, "y": 0.0}
+    elif pattern == "wedge":
+        offsets[numbers[0]] = {"x": 0.0, "y": 0.0}
+        for index, number in enumerate(numbers[1:], start=1):
+            side = -1.0 if index % 2 else 1.0
+            row = math.ceil(index / 2)
+            offsets[number] = {"x": -row * spacing, "y": side * row * spacing}
+    elif pattern == "grid":
+        columns = max(1, math.ceil(math.sqrt(count)))
+        rows = math.ceil(count / columns)
+        for index, number in enumerate(numbers):
+            row = index // columns
+            column = index % columns
+            row_width = min(columns, count - row * columns)
+            offsets[number] = {
+                "x": -row * spacing,
+                "y": (column - (row_width - 1) / 2.0) * spacing,
+            }
+    else:
+        raise ValueError("未知队形")
+    return offsets
+
+
+def formation_parameters(data, numbers):
+    pattern = str(data.get("pattern", "line"))
+    if pattern not in FORMATION_PATTERNS:
+        raise ValueError("队形仅支持横队、纵队、楔形和方阵")
+    if len(numbers) < 2:
+        raise ValueError("自动列队至少需要两台已连接 Go2")
+    spacing = bounded_float(data, "spacing", 0.8, 0.3, MAX_FORMATION_SPACING)
+    speed = bounded_float(data, "formation_speed", 0.12, 0.03, MAX_FORMATION_SPEED)
+    yaw_rate = bounded_float(data, "yaw_rate", 0.35, 0.05, MAX_YAW_RATE)
+    timeout = bounded_float(data, "timeout", CLOSED_LOOP_TIMEOUT, 5.0, 60.0)
+    position_tolerance = bounded_float(
+        data, "position_tolerance", CLOSED_LOOP_POSITION_TOLERANCE, 0.05, 0.5
+    )
+    yaw_tolerance = bounded_float(data, "yaw_tolerance", CLOSED_LOOP_YAW_TOLERANCE, 0.05, 0.8)
+    offsets = formation_offsets(numbers, pattern, spacing)
+    max_distance = max(math.hypot(offset["x"], offset["y"]) for offset in offsets.values())
+    if max_distance > MAX_FORMATION_DISTANCE:
+        raise ValueError(f"队形最大位移 {max_distance:.2f} m 超出 {MAX_FORMATION_DISTANCE:.1f} m 安全限制")
+    return {
+        "pattern": pattern,
+        "spacing": spacing,
+        "speed": speed,
+        "yaw_rate": yaw_rate,
+        "timeout": timeout,
+        "position_tolerance": position_tolerance,
+        "yaw_tolerance": yaw_tolerance,
+        "offsets": offsets,
+    }
+
+
+def map_pose_parameters(data):
+    return {
+        "x": bounded_float(data, "x", 0.0, -200.0, 200.0),
+        "y": bounded_float(data, "y", 0.0, -200.0, 200.0),
+        "z": bounded_float(data, "z", 0.0, -20.0, 20.0),
+        "yaw": bounded_float(data, "yaw", 0.0, -math.pi * 2.0, math.pi * 2.0),
+    }
+
+
 def joystick_parameters(data):
     x = bounded_float(data, "x", 0.0, -MAX_SPEED, MAX_SPEED)
     y = bounded_float(data, "y", 0.0, -MAX_SPEED, MAX_SPEED)
@@ -602,7 +1158,6 @@ def joystick_parameters(data):
         "x": x,
         "y": y,
         "z": z,
-        # Obstacle avoidance filters simulated remote-controller commands.
         "lx": y / MAX_SPEED,
         "ly": x / MAX_SPEED,
         "rx": z / MAX_YAW_RATE,
@@ -673,6 +1228,64 @@ def devices():
 @app.get("/api/sport/catalog")
 def sport_catalog():
     return jsonify({"ok": True, "profiles": SPORT_PROFILES})
+
+
+@app.get("/api/telemetry")
+def telemetry():
+    return jsonify({"ok": True, "robots": service.telemetry_payload(), "topics": TELEMETRY_TOPICS})
+
+
+@app.get("/api/map")
+def shared_map():
+    payload = service.map_payload()
+    return jsonify({"ok": True, **payload})
+
+
+@app.get("/api/video/status")
+def video_status():
+    return jsonify({"ok": True, "videos": service.video_payload()})
+
+
+@app.get("/api/video/frame/<int:number>")
+def video_frame(number):
+    frame = service.video_frame(number)
+    if not frame:
+        return payload_error("该编号暂无视频帧", 404)
+    return Response(frame, mimetype="image/jpeg")
+
+
+@app.post("/api/video")
+def video():
+    data = request.get_json(silent=True) or {}
+    try:
+        results = service.submit(
+            service.video(parse_numbers(data), bool_value(data.get("enabled", True))),
+            timeout=8.0,
+        )
+    except (ValueError, TimeoutError) as exc:
+        return payload_error(str(exc))
+    return jsonify({"ok": True, "results": results, "videos": service.video_payload()})
+
+
+@app.post("/api/frame/align")
+def align_frame():
+    data = request.get_json(silent=True) or {}
+    try:
+        number = int(data.get("number"))
+        frame = service.align_robot(number, map_pose_parameters(data))
+    except (TypeError, ValueError) as exc:
+        return payload_error(str(exc))
+    return jsonify({"ok": True, "frame": frame, "robots": service.telemetry_payload()})
+
+
+@app.post("/api/frame/clear")
+def clear_frame():
+    data = request.get_json(silent=True) or {}
+    try:
+        robots = service.clear_alignment(parse_numbers(data))
+    except ValueError as exc:
+        return payload_error(str(exc))
+    return jsonify({"ok": True, "robots": robots})
 
 
 @app.post("/api/scan")
@@ -746,6 +1359,29 @@ def command():
     except (ValueError, TimeoutError) as exc:
         return payload_error(str(exc))
     return jsonify({"ok": True, "results": results, "devices": service.list_devices()})
+
+
+@app.post("/api/formation")
+def formation():
+    data = request.get_json(silent=True) or {}
+    try:
+        numbers = parse_numbers(data)
+        parameters = formation_parameters(data, numbers)
+        if not data.get("confirm_motion"):
+            raise ValueError("自动列队会发送真机移动指令，请先开启安全确认")
+        if not data.get("confirm_formation"):
+            raise ValueError("闭环自动列队会驱动真机，必须单独确认队形区域安全")
+        results = service.submit(service.formation(numbers, parameters), timeout=45.0)
+    except (ValueError, TimeoutError) as exc:
+        return payload_error(str(exc))
+    return jsonify(
+        {
+            "ok": True,
+            "results": results,
+            "offsets": parameters.get("offsets", {}),
+            "devices": service.list_devices(),
+        }
+    )
 
 
 def main():
