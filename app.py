@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """Browser controller for multiple Go2 Air robots on the local Wi-Fi LAN."""
 
@@ -8,23 +9,30 @@ import ipaddress
 import json
 import math
 import random
+import re
 import sys
 import threading
 import time
 import types
+import uuid
+from pathlib import Path
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 from flask import Flask, jsonify, render_template, request
 from flask import Response
+from fleet.registration import (register_planar, transform_points, register_planar_layout,
+                                layout_bounds, within_layout, row_conflicts)
+from fleet.persistence import read_state, write_state
+from fleet.motion import MotionRunner, parse_program
 
 # Audio is neither available nor needed on Go2 Air. Avoid sound-device
 # enumeration when importing the installed driver.
 sys.modules.setdefault("sounddevice", types.ModuleType("sounddevice"))
 
 import unitree_webrtc_connect.webrtc_driver as webrtc_driver
-from unitree_webrtc_connect.constants import OBSTACLES_AVOID_API, RTC_TOPIC, SPORT_CMD, SPORT_CMD_MCF
+from unitree_webrtc_connect.constants import DATA_CHANNEL_TYPE, OBSTACLES_AVOID_API, RTC_TOPIC, SPORT_CMD, SPORT_CMD_MCF
 from unitree_webrtc_connect.multicast_scanner import discover_ip_sn
 
 
@@ -199,6 +207,7 @@ class Device:
     number: int
     ip: str
     sn: str = ""
+    aes_128_key: str = field(default="", repr=False)
     source: str = "manual"
     verified: bool = False
     connected: bool = False
@@ -206,12 +215,14 @@ class Device:
     busy: bool = False
     error: str = ""
     last_seen: float = field(default_factory=time.time)
+    auto_connect: bool = True
 
     def payload(self):
         return {
             "number": self.number,
             "ip": self.ip,
             "sn": self.sn,
+            "has_aes_key": bool(self.aes_128_key or os.environ.get("GO2_AES_" + self.ip.replace(".", "_"), "").strip()),
             "source": self.source,
             "verified": self.verified,
             "connected": self.connected,
@@ -219,11 +230,17 @@ class Device:
             "busy": self.busy,
             "error": self.error,
             "last_seen": self.last_seen,
+            "auto_connect": self.auto_connect,
         }
 
 
 @dataclass
 class FrameState:
+    restore_status: str = "未保存标定"
+    restore_epoch: int = 0
+    session: str = field(default_factory=lambda: uuid.uuid4().hex)
+    raw_points: np.ndarray = field(default_factory=lambda: np.empty((0, 3)), repr=False)
+    cloud_time: float = 0.0
     local_pose: dict | None = None
     map_pose: dict | None = None
     map_to_local: dict | None = None
@@ -242,12 +259,15 @@ class FrameState:
             "ip": device.ip,
             "sn": device.sn,
             "connected": device.connected,
+            "restore_status": self.restore_status,
             "aligned": self.aligned,
             "local_pose": self.local_pose,
             "map_pose": self.map_pose,
             "map_to_local": self.map_to_local,
             "anchor": self.anchor,
             "last_pose_age": round(time.time() - self.last_pose_time, 3) if self.last_pose_time else None,
+            "cloud_age": round(time.time() - self.cloud_time, 3) if self.cloud_time else None,
+            "raw_point_count": len(self.raw_points),
             "pose_topic": self.pose_topic,
             "lidar": self.lidar,
             "map_points": self.map_points,
@@ -278,25 +298,124 @@ class VideoState:
 
 
 class MultiGo2Service:
-    def __init__(self):
+    def __init__(self, state_path=None):
         self.lock = threading.Lock()
+        self.state_path = state_path
+        self.saved_alignments = {}
+        self.auto_connect_enabled = True
+        self.storage_error = ''
         self.devices = {}
         self.next_number = 1
         self.connections = {}
+        self.alignment_preview = None
+        self.restore_tasks = {}
         self.joystick_deadmen = {}
+        self.pending_motion_commands = {}
+        self.motion = MotionRunner(self._motion_snapshot, self._motion_send, self._motion_stop)
         self.frames = {}
         self.videos = {}
         self.loop = None
         self.closed = False
         self.ready = threading.Event()
+        self._load_state()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
         self.ready.wait(timeout=3.0)
         if self.loop is None:
             raise RuntimeError("无法启动 WebRTC 后端事件循环")
 
+    def _load_state(self):
+        if self.state_path is None:
+            return
+        state = read_state(self.state_path)
+        self.auto_connect_enabled = bool(state.get('auto_connect_enabled', True))
+        self.saved_alignments = state.get('alignments', {})
+        for item in state.get('devices', []):
+            device = Device(number=int(item['number']), ip=str(ipaddress.IPv4Address(item['ip'])),
+                            sn=item.get('sn', ''), aes_128_key=self.validate_aes_key(item.get('aes_128_key', '')),
+                            auto_connect=bool(item.get('auto_connect', True)))
+            self.devices[device.number] = device
+            self.frames[device.number] = FrameState(restore_status='等待连接后验证旧标定' if device.ip in self.saved_alignments else '未保存标定')
+            self.videos[device.number] = VideoState()
+            self.next_number = max(self.next_number, device.number + 1)
+
+    def _persist_locked(self):
+        if self.state_path is None:
+            return
+        try:
+            write_state(self.state_path, {'version': 1, 'auto_connect_enabled': self.auto_connect_enabled,
+                        'devices': [dict(number=d.number, ip=d.ip, sn=d.sn, aes_128_key=d.aes_128_key,
+                                         auto_connect=d.auto_connect) for d in self.devices.values()],
+                        'alignments': self.saved_alignments})
+            self.storage_error = ''
+        except (OSError, ValueError) as exc:
+            self.storage_error = f'本地配置保存失败：{exc}'
+
+    def _remember_alignment_locked(self, number):
+        frame, device = self.frames[number], self.devices[number]
+        if not frame.aligned or not frame.map_to_local or not len(frame.raw_points) or time.time()-frame.cloud_time > 3:
+            return
+        points = frame.raw_points
+        if len(points) > 4000:
+            points = points[np.linspace(0, len(points)-1, 4000, dtype=int)]
+        self.saved_alignments[device.ip] = {
+            'points': transform_points(points, frame.map_to_local).tolist(),
+            'map_height': (frame.map_pose or {}).get('z', 0), 'saved_at': time.time(), 'sn': device.sn,
+        }
+        frame.restore_status = '标定已保存，重连时自动验证'
+
+    def start_saved_connections(self):
+        if self.auto_connect_enabled:
+            numbers = [d.number for d in self.devices.values() if d.auto_connect]
+            if numbers:
+                return asyncio.run_coroutine_threadsafe(self.connect(numbers), self.loop)
+        return None
+
+    async def _restore_alignment(self, number):
+        device = self.devices[number]
+        saved = self.saved_alignments.get(device.ip)
+        if not saved:
+            return
+        frame = self.frames[number]
+        if frame.aligned:
+            return
+        session = frame.session
+        epoch = frame.restore_epoch
+        frame.restore_status = '等待新鲜点云，自动验证旧标定…'
+        for _ in range(80):
+            if self.closed or not device.connected or self.frames[number].session != session or frame.restore_epoch != epoch or frame.aligned:
+                return
+            if frame.local_pose and time.time()-frame.last_pose_time <= 1 and time.time()-frame.cloud_time <= 3 and len(frame.raw_points) >= 100:
+                break
+            await asyncio.sleep(.25)
+        else:
+            frame.restore_status = '恢复失败：定位或点云未就绪，请重新对齐'
+            return
+        try:
+            if saved.get('sn') and device.sn and saved['sn'] != device.sn:
+                raise ValueError('设备身份与旧标定不符')
+            async with self.restore_semaphore:
+                result = await asyncio.to_thread(register_planar, frame.raw_points.copy(), np.asarray(saved['points']))
+            with self.lock:
+                if self.frames[number].session != session or not device.connected or frame.aligned or frame.restore_epoch != epoch:
+                    return
+                if not result['accepted'] or result['overlap'] < .65 or result['rmse'] > .08:
+                    raise ValueError('新点云与保存地图匹配不足或有歧义')
+                if time.time()-frame.last_pose_time > 1 or time.time()-frame.cloud_time > 3:
+                    raise ValueError('定位或点云已过期')
+                frame.map_to_local = dict(result['transform'], z=saved.get('map_height', 0)-frame.local_pose.get('z', 0))
+                frame.map_pose = transform_pose(frame.map_to_local, frame.local_pose)
+                frame.anchor = dict(frame.map_pose)
+                frame.map_points = cloud_display_points(frame.raw_points, frame.map_to_local)
+                frame.aligned = True
+                frame.restore_status = f"旧标定已自动恢复（重叠 {result['overlap']:.0%}）"
+        except Exception as exc:
+            if self.frames[number].session == session and not frame.aligned and frame.restore_epoch == epoch:
+                frame.restore_status = f'需要重新对齐：{exc}'
+
     def _run_loop(self):
         self.loop = asyncio.new_event_loop()
+        self.restore_semaphore = asyncio.Semaphore(2)
         asyncio.set_event_loop(self.loop)
         self.loop.call_soon(self._keep_loop_responsive)
         self.ready.set()
@@ -315,7 +434,9 @@ class MultiGo2Service:
             raise RuntimeError("WebRTC 后端已经关闭")
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout=timeout)
 
-    def add_device(self, ip, sn="", source="manual"):
+    def add_device(self, ip, sn="", source="manual", aes_128_key=None):
+        if aes_128_key is not None:
+            aes_128_key = self.validate_aes_key(aes_128_key)
         with self.lock:
             existing = next(
                 (
@@ -326,17 +447,40 @@ class MultiGo2Service:
                 None,
             )
             if existing:
+                if aes_128_key:
+                    existing.aes_128_key = aes_128_key
                 existing.ip = ip
                 existing.sn = sn or existing.sn
                 if source in {"multicast", "probe"}:
                     existing.source = source
                 existing.last_seen = time.time()
+                self._persist_locked()
                 return existing.payload()
-            device = Device(number=self.next_number, ip=ip, sn=sn, source=source)
+            device = Device(number=self.next_number, ip=ip, sn=sn, source=source, aes_128_key=aes_128_key or "")
             self.devices[device.number] = device
             self.frames[device.number] = FrameState()
             self.videos[device.number] = VideoState()
             self.next_number += 1
+            self._persist_locked()
+            return device.payload()
+
+    @staticmethod
+    def validate_aes_key(value):
+        if not isinstance(value, str):
+            raise ValueError("AES 密钥必须是字符串")
+        value = value.strip()
+        if value and not re.fullmatch(r"[0-9a-fA-F]{32}", value):
+            raise ValueError("AES 密钥应为 32 位十六进制字符（0-9、a-f），旧固件可留空")
+        return value
+
+    def set_aes_key(self, number, value):
+        value = self.validate_aes_key(value)
+        device = self.require_devices([number])[0]
+        with self.lock:
+            if device.connected or device.busy:
+                raise ValueError("请先断开该设备，再修改密钥")
+            device.aes_128_key = value
+            self._persist_locked()
             return device.payload()
 
     def list_devices(self):
@@ -399,13 +543,28 @@ class MultiGo2Service:
     async def _connect_one(self, device):
         if device.number in self.connections:
             return {"number": device.number, "ok": True}
+        if device.busy:
+            return {"number": device.number, "ok": False, "error": "该设备正在连接，请稍候"}
         self.set_status(device.number, busy=True, error="")
-        conn = UnitreeWebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip=device.ip)
+        aes_env_name = "GO2_AES_" + str(device.ip).replace(".", "_")
+        aes_key = device.aes_128_key or os.environ.get(aes_env_name, "").strip()
+
+        connection_kwargs = {"ip": device.ip}
+
+        if aes_key:
+            connection_kwargs["aes_128_key"] = aes_key
+
+        conn = None
         try:
+            conn = UnitreeWebRTCConnection(
+                WebRTCConnectionMethod.LocalSTA,
+                **connection_kwargs
+            )
             await asyncio.wait_for(conn.connect(), timeout=20.0)
+            conn.datachannel.set_decoder("native")
             self.connections[device.number] = conn
             await conn.datachannel.disableTrafficSaving(True)
-            self.frames.setdefault(device.number, FrameState())
+            self.frames[device.number] = FrameState()
             self.videos.setdefault(device.number, VideoState())
             conn.video.add_track_callback(
                 lambda track, number=device.number: self._video_track_reader(number, track)
@@ -419,12 +578,17 @@ class MultiGo2Service:
                 avoid_enabled=avoid_enabled,
                 busy=False,
             )
+            with self.lock:
+                device.auto_connect = True
+                self._persist_locked()
+            self.restore_tasks[device.number] = asyncio.create_task(self._restore_alignment(device.number))
             return {"number": device.number, "ok": True, "avoid_enabled": avoid_enabled}
         except Exception as exc:
             self.connections.pop(device.number, None)
             try:
-                await conn.datachannel.disableTrafficSaving(False)
-                await conn.disconnect()
+                if conn is not None:
+                    await conn.datachannel.disableTrafficSaving(False)
+                    await conn.disconnect()
             except Exception:
                 pass
             self.set_status(
@@ -432,12 +596,23 @@ class MultiGo2Service:
             )
             return {"number": device.number, "ok": False, "error": str(exc)}
 
-    async def disconnect(self, numbers):
+    async def disconnect(self, numbers, preserve_auto=False):
         self.require_devices(numbers)
-        results = await asyncio.gather(*(self._disconnect_one(number) for number in numbers))
+        results = await asyncio.gather(*(self._disconnect_one(number, preserve_auto) for number in numbers))
         return results
 
-    async def _disconnect_one(self, number):
+    async def _disconnect_one(self, number, preserve_auto=False):
+        if number in self.motion.participants:
+            await self.motion.cancel()
+        with self.lock:
+            self._remember_alignment_locked(number)
+            if not preserve_auto:
+                self.devices[number].auto_connect = False
+            self._persist_locked()
+        restore_task = self.restore_tasks.pop(number, None)
+        if restore_task:
+            restore_task.cancel()
+            await asyncio.gather(restore_task, return_exceptions=True)
         task = self.joystick_deadmen.pop(number, None)
         if task:
             task.cancel()
@@ -453,6 +628,7 @@ class MultiGo2Service:
                 return {"number": number, "ok": False, "error": str(exc)}
         self.set_status(number, connected=False, avoid_enabled=False, error="")
         with self.lock:
+            self.frames[number] = FrameState()
             video = self.videos.setdefault(number, VideoState())
             video.enabled = False
         return {"number": number, "ok": True}
@@ -504,7 +680,9 @@ class MultiGo2Service:
                     frame.lidar["voxel"] = compact_voxel_stats(message)
                     frame.lidar["voxel_topic"] = topic
                     frame.lidar["voxel_time"] = time.time()
-                    frame.map_points = voxel_map_points(message, frame.map_to_local)
+                    frame.raw_points = native_cloud_points(message)
+                    frame.cloud_time = time.time()
+                    frame.map_points = cloud_display_points(frame.raw_points, frame.map_to_local)
             except Exception as exc:
                 frame.error = str(exc)
 
@@ -533,26 +711,158 @@ class MultiGo2Service:
             if number not in self.devices:
                 raise ValueError(f"不存在的编号: {number}")
             frame = self.frames.setdefault(number, FrameState())
-            if not frame.local_pose:
-                raise ValueError(f"#{number} 还没有收到 rt/utlidar/robot_pose，不能标定")
+            if not self.devices[number].connected or not frame.local_pose or time.time() - frame.last_pose_time > 1:
+                raise ValueError(f"#{number} 定位数据缺失或已过期，不能标定")
             frame.map_to_local = compute_map_to_local(map_pose, frame.local_pose)
             frame.anchor = dict(map_pose)
             frame.aligned = True
             frame.map_pose = transform_pose(frame.map_to_local, frame.local_pose)
-            frame.map_points = []
+            frame.map_points = cloud_display_points(frame.raw_points, frame.map_to_local)
             frame.error = ""
+            self._remember_alignment_locked(number)
+            self._persist_locked()
             return frame.payload(number, self.devices[number])
+
+    def start_auto_alignment(self, numbers, reference_ip, layout=None):
+        self.require_devices(numbers)
+        with self.lock:
+            if self.alignment_preview and not self.alignment_preview['done']:
+                raise ValueError('已有对齐任务正在运行，请等待完成')
+            reference = next((d for d in self.devices.values() if d.ip == reference_ip), None)
+            if not reference:
+                raise ValueError(f'参考狗 {reference_ip} 未添加，请先添加并连接')
+            numbers = sorted(set(numbers) | {reference.number})
+            snapshots, errors = {}, []
+            for number in numbers:
+                device = self.devices[number]
+                frame = self.frames[number]
+                reason = ''
+                if not device.connected:
+                    reason = '未连接'
+                elif layout and device.ip not in layout['ranks']:
+                    reason = '不在已配置的左右摆放列表中'
+                elif not frame.local_pose or time.time() - frame.last_pose_time > 1:
+                    reason = '定位已过期或缺失'
+                elif time.time() - frame.cloud_time > 3 or len(frame.raw_points) < 100:
+                    reason = '点云已过期或不足'
+                if reason:
+                    if number == reference.number:
+                        raise ValueError(f'参考狗不可用：{reason}')
+                    errors.append({'number': number, 'ip': device.ip, 'accepted': False, 'reason': reason})
+                else:
+                    snapshots[number] = {'points': frame.raw_points.copy(), 'pose': dict(frame.local_pose), 'ip': device.ip, 'session': frame.session}
+                    if layout:
+                        snapshots[number]['bounds'] = layout_bounds(layout['ranks'][device.ip], layout['min_spacing'], layout['max_spacing'])
+            if len(snapshots) < 2:
+                raise ValueError('至少需要参考狗和另一台定位、点云均正常的设备')
+            token = uuid.uuid4().hex
+            self.alignment_preview = {'token': token, 'done': False, 'created': time.time(),
+                                      'reference': reference.number, 'results': errors, 'error': ''}
+        threading.Thread(target=self._auto_alignment_worker, args=(token, reference.number, snapshots), daemon=True).start()
+        return token
+
+    def _auto_alignment_worker(self, token, reference, snapshots):
+        try:
+            ref = snapshots[reference]
+            transform = compute_map_to_local({'x': 0, 'y': 0, 'z': 0, 'yaw': 0}, ref['pose'])
+            reference_points = transform_points(ref['points'], transform)
+            for number, snapshot in snapshots.items():
+                if number == reference:
+                    result = {'transform': transform, 'accepted': True, 'overlap': 1.0, 'rmse': 0.0, 'reason': '参考狗：当前机身位置为原点，朝向为 +X'}
+                else:
+                    try:
+                        if snapshot.get('bounds'):
+                            result = register_planar_layout(snapshot['points'], reference_points, snapshot['pose'], snapshot['bounds'])
+                        else:
+                            result = register_planar(snapshot['points'], reference_points)
+                        # On a common flat floor, align the body heights independently.
+                        result['transform']['z'] = -snapshot['pose'].get('z', 0)
+                    except Exception as exc:
+                        result = {'accepted': False, 'reason': str(exc)}
+                result.update(number=number, ip=snapshot['ip'], local_pose=snapshot['pose'], session=snapshot['session'])
+                if snapshot.get('bounds'):
+                    result['bounds'] = snapshot['bounds']
+                if 'transform' in result:
+                    result['points'] = snapshot['points'][::max(1, len(snapshot['points']) // 1500)][:1500].tolist()
+                with self.lock:
+                    if self.alignment_preview['token'] != token:
+                        return
+                    self.alignment_preview['results'].append(result)
+            with self.lock:
+                results = self.alignment_preview['results']
+                conflicts = row_conflicts(results)
+                for result in results:
+                    if result['number'] in conflicts and result['number'] != reference:
+                        result['accepted'] = False
+                        result['reason'] = '匹配结果与左右顺序或相邻间距冲突，请检查点云'
+        except Exception as exc:
+            with self.lock:
+                self.alignment_preview['error'] = str(exc)
+        finally:
+            with self.lock:
+                self.alignment_preview['done'] = True
+
+    def apply_auto_alignment(self, token, adjustments):
+        with self.lock:
+            preview = self.alignment_preview
+            if not preview or token != preview['token'] or not preview['done'] or preview['error']:
+                raise ValueError('对齐预览无效，请重新生成')
+            if time.time() - preview['created'] > 300:
+                raise ValueError('预览超过 5 分钟，请重新生成')
+            if not isinstance(adjustments, dict):
+                raise ValueError('微调参数格式错误')
+            if row_conflicts(preview['results'], adjustments):
+                raise ValueError('设备位置与左右顺序或相邻间距冲突，请重新检查预览')
+            changes = []
+            for result in preview['results']:
+                if 'transform' not in result:
+                    continue
+                manual = adjustments.get(str(result['number']))
+                if not result['accepted'] and manual is None:
+                    continue
+                transform = dict(result['transform'])
+                if manual is not None:
+                    if result['number'] == preview['reference']:
+                        raise ValueError('参考狗的坐标不可微调')
+                    transform = map_pose_parameters(manual)
+                if result.get('bounds') and not within_layout(transform, result['local_pose'], result['bounds']):
+                    raise ValueError(f"#{result['number']} 超出已知摆放范围或朝向，请检查布局设置")
+                device, frame = self.devices[result['number']], self.frames[result['number']]
+                if frame.session != result['session'] or not device.connected or not frame.local_pose or time.time() - frame.last_pose_time > 1 or time.time() - frame.cloud_time > 3 or len(frame.raw_points) < 100:
+                    raise ValueError(f"#{device.number} 定位或点云已过期，请恢复数据后重新对齐")
+                changes.append((device.number, frame, transform))
+            for _, frame in self.frames.items():
+                frame.restore_epoch += 1
+                frame.aligned = False
+                frame.map_to_local = None
+                frame.map_pose = None
+                frame.map_points = []
+            self.saved_alignments.clear()
+            for number, frame, transform in changes:
+                frame.map_to_local = transform
+                frame.map_pose = transform_pose(transform, frame.local_pose)
+                frame.aligned = True
+                frame.anchor = dict(frame.map_pose)
+                frame.map_points = cloud_display_points(frame.raw_points, transform)
+                self._remember_alignment_locked(number)
+            self._persist_locked()
+            self.alignment_preview = None
+            return [number for number, _, _ in changes]
 
     def clear_alignment(self, numbers):
         self.require_devices(numbers)
         with self.lock:
             for number in numbers:
+                self.saved_alignments.pop(self.devices[number].ip, None)
+                self.frames[number].restore_epoch += 1
                 frame = self.frames.setdefault(number, FrameState())
                 frame.map_to_local = None
                 frame.anchor = None
                 frame.aligned = False
                 frame.map_pose = None
                 frame.map_points = []
+                frame.restore_status = '标定已清除'
+            self._persist_locked()
             return [
                 self.frames.setdefault(number, FrameState()).payload(number, self.devices[number])
                 for number in sorted(self.devices)
@@ -574,16 +884,68 @@ class MultiGo2Service:
         return [(number, self.connections[number]) for number in numbers]
 
     async def command(self, numbers, name, parameters):
+        if self.motion.active and self.motion.participants.intersection(numbers):
+            if name == 'stop' or (name == 'sport_action' and parameters.get('action') == 'StopMove'):
+                await self.motion.cancel()
+            elif not (name == 'sport_action' and parameters.get('query')):
+                raise ValueError('机器人正在执行闭环编排，请先停止编排再手动控制')
         connections = self.connected_connections(numbers)
-        results = await asyncio.gather(
-            *(self._command_one(number, conn, name, parameters) for number, conn in connections)
-        )
-        return results
+        moving = name in {'move', 'joystick'} or (name == 'sport_action' and not parameters.get('query')
+                                                   and parameters.get('action') != 'StopMove')
+        if moving:
+            for n in numbers:
+                self.pending_motion_commands[n] = self.pending_motion_commands.get(n, 0) + 1
+        try:
+            return await asyncio.gather(
+                *(self._command_one(number, conn, name, parameters) for number, conn in connections)
+            )
+        finally:
+            if moving:
+                for n in numbers:
+                    count = self.pending_motion_commands[n] - 1
+                    if count:
+                        self.pending_motion_commands[n] = count
+                    else:
+                        self.pending_motion_commands.pop(n)
+
+    def _motion_snapshot(self, number):
+        with self.lock:
+            frame, device = self.frames.get(number), self.devices.get(number)
+            if not frame or not device:
+                return None
+            return {'connected': device.connected and number in self.connections,
+                    'aligned': frame.aligned, 'age': time.time()-frame.last_pose_time,
+                    'pose': dict(frame.map_pose or {}), 'transform': dict(frame.map_to_local or {})}
+
+    def _motion_send(self, number, vx, vy, wz):
+        self._move_without_reply(self.connections[number], vx, vy, wz)
+
+    async def _motion_stop(self, number):
+        conn = self.connections.get(number)
+        if conn is None:
+            raise RuntimeError('连接不可用，无法确认停止')
+        self._move_without_reply(conn, 0., 0., 0.)
+        await self._sport_request(conn, SPORT_CMD['StopMove'])
+
+    async def start_motion(self, program):
+        numbers = list(program['steps'][0]['targets'])
+        self.connected_connections(numbers)
+        if any(n in self.pending_motion_commands for n in numbers):
+            raise ValueError('参与机器人仍有手动动作指令执行中，请等待完成后再开始闭环编排')
+        state = await self.motion.start(program)
+        # An old joystick deadman must not stop a newly started controller.
+        for n in numbers:
+            task = self.joystick_deadmen.pop(n, None)
+            if task:
+                task.cancel()
+        return state
+
+    async def motion_status(self):
+        return self.motion.payload()
 
     async def formation(self, numbers, parameters):
-        connections = self.connected_connections(numbers)
+        self.connected_connections(numbers)
         ordered_numbers = sorted(numbers)
-        offsets = formation_offsets(ordered_numbers, parameters["pattern"], parameters["spacing"])
         leader_number = ordered_numbers[0]
         leader_pose = self.current_map_pose(leader_number)
         if not leader_pose:
@@ -597,6 +959,9 @@ class MultiGo2Service:
         if not_aligned:
             raise ValueError(f"以下 Go2 尚未对齐到 map frame: {not_aligned}")
 
+        poses = {n: item['pose'] for n, item in self.motion.poses(ordered_numbers).items()}
+        offsets = formation_offsets(ordered_numbers, parameters["pattern"], parameters["spacing"],
+                                    poses, leader_pose['yaw'])
         targets = {}
         for number, offset in offsets.items():
             dx, dy = rotate_xy(offset["x"], offset["y"], leader_pose["yaw"])
@@ -607,50 +972,17 @@ class MultiGo2Service:
                 "yaw": leader_pose["yaw"],
             }
 
-        return await asyncio.gather(
-            *(
-                self._closed_loop_to_target(number, conn, targets[number], parameters)
-                for number, conn in connections
-            )
-        )
-
-    async def _closed_loop_to_target(self, number, conn, target, parameters):
-        deadline = time.monotonic() + parameters["timeout"]
-        last_error = None
-        try:
-            while time.monotonic() < deadline:
-                pose = self.current_map_pose(number)
-                if not pose:
-                    raise RuntimeError("map_pose 不可用或已超时")
-                dx = target["x"] - pose["x"]
-                dy = target["y"] - pose["y"]
-                distance = math.hypot(dx, dy)
-                yaw_error = normalize_angle(target["yaw"] - pose["yaw"])
-                last_error = {"distance": round(distance, 3), "yaw": round(yaw_error, 3)}
-                if (
-                    distance <= parameters["position_tolerance"]
-                    and abs(yaw_error) <= parameters["yaw_tolerance"]
-                ):
-                    await self._sport_request(conn, SPORT_CMD["StopMove"])
-                    return {"number": number, "ok": True, "target": target, "error": last_error}
-
-                local_x, local_y = rotate_xy(dx, dy, -pose["yaw"])
-                scale = min(parameters["speed"] / max(distance, 0.001), 1.0)
-                vx = clamp(local_x * scale, -parameters["speed"], parameters["speed"])
-                vy = clamp(local_y * scale, -parameters["speed"], parameters["speed"])
-                wz = clamp(yaw_error * 0.8, -parameters["yaw_rate"], parameters["yaw_rate"])
-                self._move_without_reply(conn, vx, vy, wz)
-                await asyncio.sleep(0.12)
-
-            await self._sport_request(conn, SPORT_CMD["StopMove"])
-            return {"number": number, "ok": False, "error": f"闭环列队超时: {last_error}", "target": target}
-        except Exception as exc:
-            try:
-                await self._sport_request(conn, SPORT_CMD["StopMove"])
-            except Exception:
-                pass
-            self.set_status(number, error=str(exc))
-            return {"number": number, "ok": False, "error": str(exc), "target": target}
+        program = parse_program({
+            **parameters, 'min_separation': .5,
+            'steps': [{'targets': {str(n): target for n, target in targets.items()},
+                       'timeout': parameters['timeout']}],
+        })
+        await self.start_motion(program)
+        task, state = self.motion.task, self.motion.state
+        await asyncio.shield(task)
+        return [{'number': n, 'ok': state['status'] == 'completed' and not state.get('stop_error'),
+                 'target': targets[n], 'error': state.get('stop_error') or state['error'] or
+                 ('' if state['status'] == 'completed' else state['status'])} for n in numbers]
 
     async def _command_one(self, number, conn, name, parameters):
         try:
@@ -717,6 +1049,9 @@ class MultiGo2Service:
 
     @staticmethod
     def _move_without_reply(conn, x, y, z):
+        channel = conn.datachannel.pub_sub.channel
+        if channel is None or channel.readyState != 'open':
+            raise RuntimeError('运动指令未发送：WebRTC 数据通道未打开，请重新连接')
         request_id = int(time.time() * 1000) % 2147483648 + random.randint(0, 1000)
         payload = {
             "header": {
@@ -726,7 +1061,9 @@ class MultiGo2Service:
             "parameter": json.dumps({"x": x, "y": y, "z": z}),
             "binary": [],
         }
-        conn.datachannel.pub_sub.publish_without_callback(RTC_TOPIC["SPORT_MOD"], payload)
+        conn.datachannel.pub_sub.publish_without_callback(
+            RTC_TOPIC["SPORT_MOD"], payload, msg_type=DATA_CHANNEL_TYPE["REQUEST"]
+        )
 
     @staticmethod
     def _publish_wireless_controller(conn, lx=0.0, ly=0.0, rx=0.0, ry=0.0, keys=0):
@@ -816,10 +1153,11 @@ class MultiGo2Service:
             return self.videos.setdefault(number, VideoState()).frame
 
     async def stop_and_disconnect_all(self):
+        await self.motion.cancel()
         numbers = list(self.connections)
         if numbers:
             await self.command(numbers, "stop", {})
-            await self.disconnect(numbers)
+            await self.disconnect(numbers, preserve_auto=True)
 
     def close(self):
         if self.closed or self.loop is None:
@@ -835,7 +1173,7 @@ class MultiGo2Service:
 
 
 app = Flask(__name__, template_folder="wifi_web/templates", static_folder="wifi_web/static")
-service = MultiGo2Service()
+service = MultiGo2Service(state_path=Path(__file__).resolve().parent / '.local_state' / 'fleet.json')
 atexit.register(service.close)
 
 
@@ -967,6 +1305,8 @@ def compact_lidar_state(message):
 def compact_voxel_stats(message):
     payload = nested(message, "data", "data")
     if isinstance(payload, dict):
+        if "points" in payload:
+            return {"point_count": len(payload["points"]), "face_count": 0}
         return {
             "point_count": int(payload.get("point_count") or 0),
             "face_count": int(payload.get("face_count") or 0),
@@ -977,42 +1317,24 @@ def compact_voxel_stats(message):
     return {"raw_type": type(payload).__name__}
 
 
-def voxel_map_points(message, transform):
-    if not transform:
-        return []
+def native_cloud_points(message):
     payload = nested(message, "data", "data")
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or "points" not in payload:
+        return np.empty((0, 3))
+    points = np.asarray(payload['points'], dtype=float).reshape(-1, 3)
+    points = points[np.isfinite(points).all(axis=1)]
+    points = points[(np.abs(points[:, :2]) < 80).all(axis=1) & (np.abs(points[:, 2]) < 10)]
+    if len(points) > 15000:
+        points = points[np.linspace(0, len(points) - 1, 15000, dtype=int)]
+    return points
+
+
+def cloud_display_points(points, transform):
+    if not transform or not len(points):
         return []
-    positions = payload.get("positions")
-    if positions is None:
-        return []
-    try:
-        raw = positions.tobytes() if hasattr(positions, "tobytes") else bytes(positions)
-        floats = np.frombuffer(raw, dtype=np.float32)
-        usable = (floats.size // 3) * 3
-        if usable <= 0:
-            return []
-        points = floats[:usable].reshape((-1, 3))
-        if len(points) > LIDAR_MAP_POINT_LIMIT:
-            step = max(1, len(points) // LIDAR_MAP_POINT_LIMIT)
-            points = points[::step]
-        mapped = []
-        for x, y, z in points:
-            if not np.isfinite(x) or not np.isfinite(y) or not np.isfinite(z):
-                continue
-            if abs(float(x)) > 80.0 or abs(float(y)) > 80.0 or abs(float(z)) > 10.0:
-                continue
-            map_x, map_y = rotate_xy(float(x), float(y), transform["yaw"])
-            mapped.append(
-                {
-                    "x": round(map_x + transform["x"], 3),
-                    "y": round(map_y + transform["y"], 3),
-                    "z": round(float(z) + transform.get("z", 0.0), 3),
-                }
-            )
-        return mapped[:LIDAR_MAP_POINT_LIMIT]
-    except Exception:
-        return []
+    step = max(1, len(points) // LIDAR_MAP_POINT_LIMIT)
+    return [dict(x=round(float(x), 3), y=round(float(y), 3), z=round(float(z), 3))
+            for x, y, z in transform_points(points[::step][:LIDAR_MAP_POINT_LIMIT], transform)]
 
 
 def parse_numbers(data):
@@ -1075,12 +1397,18 @@ def movement_parameters(data):
     return {"x": x, "y": y, "z": z, "duration": duration}
 
 
-def formation_offsets(numbers, pattern, spacing):
+def formation_offsets(numbers, pattern, spacing, poses=None, reference_yaw=0.0):
     count = len(numbers)
     center = (count - 1) / 2.0
     offsets = {}
     if pattern == "line":
-        for index, number in enumerate(numbers):
+        if not poses or any(n not in poses for n in numbers):
+            raise ValueError('横队需要全部参与机器人的实时位置')
+        # Body-frame +Y points left. Assign right-to-left slots in the same
+        # order as current lateral positions, independent of robot numbering.
+        c, s = math.cos(reference_yaw), math.sin(reference_yaw)
+        lateral_order = sorted(numbers, key=lambda n: (-s*poses[n]['x']+c*poses[n]['y'], n))
+        for index, number in enumerate(lateral_order):
             offsets[number] = {"x": 0.0, "y": (index - center) * spacing}
     elif pattern == "column":
         for index, number in enumerate(numbers):
@@ -1160,7 +1488,8 @@ def joystick_parameters(data):
         "z": z,
         "lx": y / MAX_SPEED,
         "ly": x / MAX_SPEED,
-        "rx": z / MAX_YAW_RATE,
+        # Wireless right-stick +X is right; Sport positive yaw turns left.
+        "rx": -z / MAX_YAW_RATE,
     }
 
 
@@ -1222,7 +1551,19 @@ def index():
 
 @app.get("/api/devices")
 def devices():
-    return jsonify({"ok": True, "devices": service.list_devices(), "audio_enabled": False})
+    return jsonify({"ok": True, "devices": service.list_devices(), "audio_enabled": False, "storage_error": service.storage_error})
+
+
+@app.route('/api/settings', methods=['GET', 'POST'])
+def saved_settings():
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        with service.lock:
+            service.auto_connect_enabled = bool_value(data.get('auto_connect_enabled', True))
+            service._persist_locked()
+            if service.storage_error:
+                return payload_error(service.storage_error)
+    return jsonify(ok=True, auto_connect_enabled=service.auto_connect_enabled, storage_error=service.storage_error)
 
 
 @app.get("/api/sport/catalog")
@@ -1278,6 +1619,62 @@ def align_frame():
     return jsonify({"ok": True, "frame": frame, "robots": service.telemetry_payload()})
 
 
+@app.post('/api/frame/auto-align')
+def auto_align():
+    data = request.get_json(silent=True) or {}
+    try:
+        reference_ip = parse_ip(data.get('reference_ip', '192.168.31.191'))
+        layout = parse_row_layout(data, reference_ip) if bool_value(data.get('layout_enabled', False)) else None
+        token = service.start_auto_alignment(parse_numbers(data), reference_ip, layout)
+    except ValueError as exc:
+        return payload_error(str(exc))
+    return jsonify(ok=True, token=token)
+
+
+def parse_row_layout(data, reference_ip):
+    min_spacing = bounded_float(data, 'min_spacing', .5, .3, 2)
+    max_spacing = bounded_float(data, 'max_spacing', .8, .3, 2)
+    if min_spacing > max_spacing:
+        raise ValueError('最小间距不能大于最大间距')
+    ranks = {reference_ip: 0}
+    prefix = reference_ip.rsplit('.', 1)[0]
+    for side, sign in [('left_ips', 1), ('right_ips', -1)]:
+        entries = data.get(side)
+        if not isinstance(entries, str):
+            raise ValueError('请按由近到远的顺序填写左右设备 IP')
+        parts = re.split(r'[,，\s]+', entries.strip())
+        parts = [part for part in parts if part]
+        if len(parts) > 10:
+            raise ValueError('每侧最多填写 10 台设备')
+        for rank, value in enumerate(parts, 1):
+            ip = parse_ip(f'{prefix}.{value}' if value.isdigit() else value)
+            if ip in ranks:
+                raise ValueError('左右设备列表不能重复，也不能包含参考狗')
+            ranks[ip] = sign * rank
+    if len(ranks) < 2:
+        raise ValueError('请至少填写一台参考狗以外的设备')
+    return {'ranks': ranks, 'min_spacing': min_spacing, 'max_spacing': max_spacing}
+
+
+@app.get('/api/frame/auto-align/<token>')
+def auto_align_status(token):
+    with service.lock:
+        preview = service.alignment_preview
+        if not preview or preview['token'] != token:
+            return payload_error('预览不存在，请重新生成')
+        return jsonify(ok=True, **preview)
+
+
+@app.post('/api/frame/auto-align/apply')
+def apply_auto_align():
+    data = request.get_json(silent=True) or {}
+    try:
+        numbers = service.apply_auto_alignment(data.get('token'), data.get('adjustments', {}))
+    except (ValueError, TypeError) as exc:
+        return payload_error(str(exc))
+    return jsonify(ok=True, aligned=numbers, robots=service.telemetry_payload())
+
+
 @app.post("/api/frame/clear")
 def clear_frame():
     data = request.get_json(silent=True) or {}
@@ -1307,7 +1704,17 @@ def scan():
 def add_device():
     data = request.get_json(silent=True) or {}
     try:
-        device = service.add_device(parse_ip(data.get("ip", "")))
+        device = service.add_device(parse_ip(data.get("ip", "")), aes_128_key=data.get("aes_128_key"))
+    except ValueError as exc:
+        return payload_error(str(exc))
+    return jsonify({"ok": True, "device": device, "devices": service.list_devices()})
+
+
+@app.post("/api/devices/<int:number>/aes-key")
+def set_device_aes_key(number):
+    data = request.get_json(silent=True) or {}
+    try:
+        device = service.set_aes_key(number, data.get("aes_128_key", ""))
     except ValueError as exc:
         return payload_error(str(exc))
     return jsonify({"ok": True, "device": device, "devices": service.list_devices()})
@@ -1371,7 +1778,7 @@ def formation():
             raise ValueError("自动列队会发送真机移动指令，请先开启安全确认")
         if not data.get("confirm_formation"):
             raise ValueError("闭环自动列队会驱动真机，必须单独确认队形区域安全")
-        results = service.submit(service.formation(numbers, parameters), timeout=45.0)
+        results = service.submit(service.formation(numbers, parameters), timeout=parameters['timeout'] + 8.0)
     except (ValueError, TimeoutError) as exc:
         return payload_error(str(exc))
     return jsonify(
@@ -1384,12 +1791,40 @@ def formation():
     )
 
 
+@app.route('/api/motion', methods=['GET', 'POST'])
+def motion_program():
+    try:
+        if request.method == 'GET':
+            state = service.submit(service.motion_status(), timeout=3.)
+        else:
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict) or data.get('confirm_motion') is not True or data.get('confirm_formation') is not True:
+                raise ValueError('请开启真机动作确认，并确认移动区域和坐标标定')
+            program = parse_program(data.get('program'))
+            state = service.submit(service.start_motion(program), timeout=5.)
+        return jsonify(ok=True, motion=state)
+    except (ValueError, TimeoutError) as exc:
+        return payload_error(str(exc))
+
+
+@app.post('/api/motion/stop')
+def stop_motion_program():
+    try:
+        state = service.submit(service.motion.cancel(), timeout=5.)
+        return jsonify(ok=True, motion=state)
+    except (ValueError, TimeoutError) as exc:
+        return payload_error(str(exc))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Go2 Air Wi-Fi multi-robot browser controller")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8090, type=int)
+    parser.add_argument("--no-auto-connect", action="store_true", help="本次启动不自动连接设备")
     args = parser.parse_args()
     try:
+        if not args.no_auto_connect:
+            service.start_saved_connections()
         app.run(host=args.host, port=args.port, debug=False, threaded=True)
     finally:
         service.close()

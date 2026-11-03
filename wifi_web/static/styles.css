@@ -14,6 +14,11 @@
 }
 
 * { box-sizing: border-box; }
+.motion-panel { display: grid; gap: 14px; min-width: 0; }
+#motionProgram { width: 100%; resize: vertical; padding: 12px; font-family: monospace; }
+.motion-table-wrap { overflow-x: auto; }
+.motion-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.motion-table td, .motion-table th { padding: 8px; border-bottom: 1px solid var(--line); text-align: left; }
 body {
   margin: 0;
   background: var(--bg);
@@ -83,7 +88,7 @@ input[type="checkbox"] { accent-color: var(--brand); }
 .inline { display: block; color: var(--muted); font-size: 14px; margin: 18px 0; }
 .field { display: block; color: var(--muted); font-size: 13px; margin: 0 0 14px; }
 .field input { padding: 10px 12px; width: 100%; margin-top: 6px; }
-.manual { display: flex; gap: 8px; margin-bottom: 18px; }
+.manual { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
 .manual input { padding: 11px 12px; min-width: 0; flex: 1; }
 .actions { display: flex; flex-wrap: wrap; gap: 7px; justify-content: end; }
 .device-list { display: grid; gap: 8px; }
@@ -98,6 +103,8 @@ input[type="checkbox"] { accent-color: var(--brand); }
   align-items: center;
 }
 .device.connected { background: var(--connected); }
+.device-key { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+.device-key input { flex: 1; min-width: 160px; padding: 9px 12px; }
 .number { font-weight: 700; color: var(--brand); }
 .address { font-family: ui-monospace, "SFMono-Regular", monospace; font-size: 14px; }
 .detail { color: var(--muted); font-size: 12px; margin-top: 3px; }
@@ -205,6 +212,13 @@ input[type="checkbox"] { accent-color: var(--brand); }
 .remote .deadman { text-align: center; color: #9fada7; margin-top: 15px; }
 .formation-panel { grid-column: 1 / -1; }
 .frame-panel { grid-column: 1 / -1; }
+[hidden] { display: none !important; }
+.alignment-results { display: grid; gap: 6px; margin-bottom: 14px; }
+.alignment-result { padding: 9px 12px; border-left: 4px solid #bc7c27; background: #fff6e5; font-size: 13px; }
+.alignment-result.accepted { border-color: var(--brand); background: var(--connected); }
+.frame-settings select, #referenceIp { padding: 9px; margin-top: 5px; max-width: 210px; }
+.frame-panel summary { cursor: pointer; margin: 12px 0; color: var(--muted); }
+#sharedMapCanvas { touch-action: none; }
 .frame-settings {
   display: flex;
   flex-wrap: wrap;

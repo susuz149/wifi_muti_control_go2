@@ -23,13 +23,17 @@
           <button id="scanButton" class="primary">扫描当前 Wi-Fi</button>
         </div>
         <label class="inline"><input id="autoConnect" type="checkbox"> 扫描后自动连接发现的候选设备并验证为 Go2</label>
+        <label class="inline"><input id="startupAutoConnect" type="checkbox" checked> 启动程序时自动连接已保存设备</label>
+        <p id="persistenceMessage" class="message">设备和密钥自动保存在本机；连接后自动用新点云验证并恢复已保存标定。匹配不足时会提示重新对齐。</p>
         <label class="field">扫描网段
           <input id="scanSubnet" value="192.168.12.0/24" placeholder="192.168.12.0/24">
         </label>
         <div class="manual">
           <input id="manualIp" placeholder="手动输入 IP，例如 192.168.12.14">
+          <input id="manualAesKey" type="password" autocomplete="off" aria-label="设备 AES 密钥" placeholder="AES 密钥（可选，32 位十六进制）">
           <button id="addButton">添加设备</button>
         </div>
+        <p class="message">固件 ≥ 1.1.15 可填写每台狗各自的 AES 密钥；旧固件留空。扫描发现后也可在设备列表中设置。密钥保存在本机仅当前用户可读写的配置文件中。</p>
         <p id="scanMessage" class="message">扫描结果将按发现顺序编号；端口候选连接成功后才确认为 Go2。</p>
       </section>
 
@@ -108,11 +112,36 @@
       <section class="panel frame-panel">
         <div class="panel-title">
           <div>
-            <h2>坐标系对齐与 LiDAR 隔离</h2>
-            <p class="message">每台机器只使用自己的 `rt/utlidar/*` 回调；先逐台标定当前 local pose 在 map 中的位置，再生成统一 map frame。</p>
+            <h2>自动坐标对齐与 LiDAR 状态</h2>
+            <p class="message">让机器人在同一平地静止，扫描共同墙面、柱子等环境。以参考狗当前的位置为原点、朝向为 +X，自动匹配选中机器的点云；检查预览后应用。不会移动机器人。</p>
           </div>
           <button id="refreshTelemetryButton">刷新状态</button>
         </div>
+        <div class="frame-settings">
+          <label>参考狗 IP <input id="referenceIp" value="192.168.31.191" aria-label="参考狗 IP"></label>
+          <button id="autoAlignButton" class="primary">自动对齐选中设备</button>
+          <button id="applyAutoAlignButton" disabled>应用预览</button>
+          <button id="cancelAutoAlignButton">退出预览</button>
+        </div>
+        <label class="inline"><input id="layoutEnabled" type="checkbox" checked> 使用已知摆放布局：同向横排，左右以参考狗头朝向为准</label>
+        <div class="frame-settings">
+          <label>左侧由近到远（IP 或末段）<input id="layoutLeftIps" value="214, 120, 103"></label>
+          <label>右侧由近到远（IP 或末段）<input id="layoutRightIps" value="142, 113, 232"></label>
+          <label>相邻机身中心最小间距 m <input id="layoutMinSpacing" type="number" min="0.3" max="2" step="0.05" value="0.5"></label>
+          <label>相邻机身中心最大间距 m <input id="layoutMaxSpacing" type="number" min="0.3" max="2" step="0.05" value="0.8"></label>
+        </div>
+        <p class="message">布局只限定点云匹配的搜索范围，实际位置仍需点云验证。前后偏差允许 ±0.4m，同向偏差允许 ±20°；摆放改变后请更新列表，或关闭布局约束。</p>
+        <p class="message">对齐需要新鲜定位和重叠点云。定位过期的设备会跳过；匹配不足时可微调预览。应用会替换全部旧标定，未通过的设备需重新对齐。</p>
+        <div id="alignmentResults" class="alignment-results"></div>
+        <div id="alignmentEditor" class="frame-settings" hidden>
+          <label>微调设备 <select id="adjustRobot"></select></label>
+          <button id="adjustLeft">← 左移 0.1m</button><button id="adjustRight">右移 0.1m →</button>
+          <button id="adjustForward">↑ 前移 0.1m</button><button id="adjustBack">后移 0.1m ↓</button>
+          <button id="adjustCCW">逆时针 2°</button><button id="adjustCW">顺时针 2°</button>
+          <button id="acceptAdjustment">确认该设备的预览</button>
+        </div>
+        <details>
+        <summary>手动坐标标定（备用）</summary>
         <div class="frame-settings">
           <label>编号 <input id="alignNumber" type="number" min="1" step="1" value="1"></label>
           <label>map x <input id="alignX" type="number" step="0.05" value="0"></label>
@@ -122,10 +151,11 @@
           <button id="alignButton" class="primary">标定该编号</button>
           <button id="clearAlignButton">清除选中标定</button>
         </div>
+        </details>
         <div id="frameList" class="frame-list empty">连接机器人后显示各自 local/map pose 和 LiDAR 统计。</div>
         <div class="shared-map">
           <canvas id="sharedMapCanvas" width="1000" height="420"></canvas>
-          <p class="message">共同 LiDAR 图只显示已标定到 map frame 的机器；颜色按机器人编号区分。</p>
+          <p id="mapModeNote" class="message">颜色按机器人编号区分；预览时可拖动所选设备的点云，或用按钮移动、旋转。平地对齐仅计算水平位置和朝向。</p>
         </div>
         <p id="frameMessage" class="message"></p>
       </section>
@@ -149,7 +179,7 @@
         <div class="panel-title">
           <div>
             <h2>自动列队</h2>
-            <p class="message">对当前勾选的已连接机器人按编号分配队形位置；需要先完成 map frame 标定，执行时按实时 map_pose 闭环修正。</p>
+            <p class="message">横队按当前位置保留左右顺序，其余队形按编号分配位置；需要先完成 map frame 标定，执行时按实时 map_pose 闭环修正。</p>
           </div>
           <button id="formationButton" class="primary">执行列队</button>
         </div>
@@ -174,9 +204,35 @@
 
         <div class="formation-preview">
           <canvas id="formationCanvas" width="620" height="300"></canvas>
-          <p class="message">选中编号最小者作为队形参考点；目标点在 map frame 中生成，每台机器用自己的 map_pose 闭环靠近目标。</p>
+          <p class="message">以选中编号最小者的当前位置和朝向为基准生成目标。横队保留当前左右顺序，队形中心位于该基准位置，两台都可能移动；间距为相邻目标中心的距离。</p>
         </div>
         <p id="formationMessage" class="message"></p>
+      </section>
+
+      <section class="panel motion-panel">
+        <div class="panel-title">
+          <div><h2>目标位置闭环编排</h2>
+            <p class="message">坐标使用已标定的 map frame，单位米；yaw 使用弧度。全体稳定到位后进入下一段。</p></div>
+        </div>
+        <p class="message">先勾选机器人，再读取当前位置生成模板。模板不会移动机器人；修改目标后再执行。每段需包含相同编号。路线距离检查仅覆盖参与机器，不包含障碍物和未参与设备。</p>
+        <div class="actions">
+          <button id="motionCapture">读取选中位置生成模板</button>
+          <button id="motionExport">导出 JSON</button>
+          <label>导入 JSON <input id="motionImport" type="file" accept=".json,application/json"></label>
+        </div>
+        <label for="motionProgram">目标点编排 JSON</label>
+        <textarea id="motionProgram" rows="15" spellcheck="false" placeholder="先读取选中机器人的当前位置"></textarea>
+        <div class="actions">
+          <button id="motionStart" class="primary">执行闭环编排</button>
+          <button id="motionStop" class="danger">停止整组编排</button>
+        </div>
+        <p id="motionMessage" class="message" role="status"></p>
+        <p id="motionStatus" class="message" role="status"></p>
+        <div class="motion-table-wrap"><table class="motion-table">
+          <thead><tr><th>编号</th><th>实际位置 / 朝向</th><th>目标位置 / 朝向</th><th>误差</th><th>速度指令（机身坐标）</th><th>到位</th></tr></thead>
+          <tbody id="motionRobots"></tbody>
+        </table></div>
+        <p class="message">速度列为发送的控制指令，并非实测速度。暂停编排后请检查位置再重新执行；此版本不保证与音乐定时同步，也不自动绕障。</p>
       </section>
 
       <section class="panel sdk-panel">
