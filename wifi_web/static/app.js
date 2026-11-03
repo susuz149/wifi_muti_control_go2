@@ -4,8 +4,176 @@ const sticks = {
   right: { x: 0, y: 0, active: false },
 };
 let stickTimer = null;
+const aesKeyDrafts = new Map();
+let alignmentPreview = null;
+let alignmentView = null;
+let alignmentDrag = null;
+let alignmentRequest = 0;
+
+function previewPose(pose, transform) {
+  const c = Math.cos(transform.yaw), s = Math.sin(transform.yaw);
+  return { x: pose.x*c-pose.y*s+transform.x, y: pose.x*s+pose.y*c+transform.y,
+    z: (pose.z || 0) + (transform.z || 0), yaw: (pose.yaw || 0)+transform.yaw };
+}
+
+function previewScene() {
+  const results = (alignmentPreview?.results || []).filter((r) => r.transform);
+  return {
+    points: results.flatMap((r) => r.points.map(([x,y,z]) => ({ number:r.number, ...previewPose({x,y,z},r.transform) }))),
+    robots: results.map((r) => ({ number:r.number, map_pose:previewPose(r.local_pose,r.transform) })),
+  };
+}
+
+function renderAlignmentResults() {
+  const container = byId("alignmentResults");
+  container.replaceChildren();
+  const previous = byId("adjustRobot").value;
+  byId("adjustRobot").replaceChildren();
+  (alignmentPreview?.results || []).forEach((r) => {
+    const line = document.createElement("div");
+    line.className = `alignment-result ${r.accepted || r.manualConfirmed ? "accepted" : ""}`;
+    const pose = r.transform ? previewPose(r.local_pose, r.transform) : null;
+    const slot = r.bounds ? (r.bounds.rank === 0 ? "中心参考" : `${r.bounds.rank > 0 ? "左" : "右"}${Math.abs(r.bounds.rank)}`) : "";
+    line.textContent = `#${r.number} ${r.ip}${slot ? ` [${slot}]` : ""} · ${r.manualConfirmed ? "已人工确认" : r.reason}${r.overlap !== undefined ? ` · 重叠 ${(r.overlap*100).toFixed(0)}% / 匹配误差 ${r.rmse}m` : ""}${pose ? ` · 位置(${pose.x.toFixed(2)}, ${pose.y.toFixed(2)})m / 朝向 ${(pose.yaw*180/Math.PI).toFixed(1)}°` : ""}`;
+    container.appendChild(line);
+    if (r.transform && r.number !== alignmentPreview.reference) {
+      const option = document.createElement("option");
+      option.value = r.number;
+      option.textContent = `#${r.number} ${r.ip}`;
+      byId("adjustRobot").appendChild(option);
+    }
+  });
+  if ([...byId("adjustRobot").options].some((o) => o.value === previous)) byId("adjustRobot").value = previous;
+  byId("alignmentEditor").hidden = !alignmentPreview?.done || !byId("adjustRobot").options.length;
+  byId("applyAutoAlignButton").disabled = !alignmentPreview?.done || !!alignmentPreview?.error;
+}
+
+async function autoAlign() {
+  const requestId = ++alignmentRequest;
+  byId("autoAlignButton").disabled = true;
+  alignmentPreview = null;
+  alignmentView = null;
+  renderAlignmentResults();
+  setMessage(byId("frameMessage"), "正在匹配点云，请保持机器人静止；预览不会改变现有坐标。");
+  try {
+    const start = await api("/api/frame/auto-align", {method:"POST", body:JSON.stringify({
+      targets:selectedNumbers(), reference_ip:byId("referenceIp").value,
+      layout_enabled:byId("layoutEnabled").checked,
+      left_ips:byId("layoutLeftIps").value, right_ips:byId("layoutRightIps").value,
+      min_spacing:byId("layoutMinSpacing").value, max_spacing:byId("layoutMaxSpacing").value,
+    })});
+    while (requestId === alignmentRequest) {
+      const result = await api(`/api/frame/auto-align/${start.token}`);
+      if (requestId !== alignmentRequest) return;
+      alignmentPreview = result;
+      renderAlignmentResults();
+      drawSharedMap();
+      if (result.done) {
+        if (result.error) throw new Error(result.error);
+        setMessage(byId("frameMessage"), "预览完成。检查墙面、柱子是否重合；可拖动和旋转微调，确认后应用。匹配失败的设备不会自动应用。");
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    }
+  } catch (error) {
+    if (requestId === alignmentRequest) setMessage(byId("frameMessage"), error.message, true);
+  } finally {
+    if (requestId === alignmentRequest) byId("autoAlignButton").disabled = false;
+  }
+}
+
+function adjustPreview(dx, dy, angle=0) {
+  const r = alignmentPreview?.results.find((item) => item.number === Number(byId("adjustRobot").value));
+  if (!r?.transform) return;
+  // Rotate about this robot's current preview position, rather than world origin.
+  const pose = previewPose(r.local_pose, r.transform);
+  r.transform.yaw += angle;
+  const rotated = previewPose(r.local_pose, r.transform);
+  r.transform.x += pose.x-rotated.x+dx;
+  r.transform.y += pose.y-rotated.y+dy;
+  r.adjusted = true;
+  r.accepted = false;
+  r.manualConfirmed = false;
+  r.reason = "已微调，请确认该设备的预览";
+  renderAlignmentResults();
+  drawSharedMap();
+}
+
+async function applyAutoAlign() {
+  if (!alignmentPreview?.done) return;
+  if (alignmentPreview.results.some((r) => r.adjusted && !r.manualConfirmed)) {
+    setMessage(byId("frameMessage"), "有微调尚未确认，请先确认该设备的预览。", true);
+    return;
+  }
+  const adjustments = Object.fromEntries(alignmentPreview.results.filter((r) => r.manualConfirmed).map((r) => [r.number,r.transform]));
+  try {
+    const result = await api("/api/frame/auto-align/apply", {method:"POST", body:JSON.stringify({token:alignmentPreview.token,adjustments})});
+    alignmentPreview = null;
+    alignmentView = null;
+    renderAlignmentResults();
+    state.telemetry = result.robots;
+    await refreshSharedMap();
+    setMessage(byId("frameMessage"), `已对齐：${result.aligned.map((n) => `#${n}`).join("、")}。其余设备保持未标定，请检查位置后再列队。`);
+  } catch (error) { setMessage(byId("frameMessage"), error.message, true); }
+}
 
 function byId(id) { return document.getElementById(id); }
+
+function renderMotion(motion) {
+  const labels = {idle:"未执行", running:"执行中", completed:"已完成", cancelled:"已停止", failed:"执行失败"};
+  setMessage(byId("motionStatus"), `${labels[motion.status] || motion.status} · 第 ${motion.step}/${motion.total_steps || 0} 段${motion.error ? ` · ${motion.error}` : ""}${motion.stop_error ? ` · ${motion.stop_error}` : ""}`,
+    motion.status === "failed" || !!motion.stop_error);
+  byId("motionStart").disabled = motion.status === "running";
+  const body = byId("motionRobots");
+  body.replaceChildren();
+  const fmt = (v) => Number(v).toFixed(2);
+  Object.entries(motion.robots || {}).forEach(([number, robot]) => {
+    const row = document.createElement("tr");
+    const pose = (p) => `(${fmt(p.x)}, ${fmt(p.y)}) / ${fmt(p.yaw)} rad`;
+    [`#${number}`, pose(robot.pose), pose(robot.target),
+      `${fmt(robot.distance)} m / ${fmt(robot.yaw_error)} rad`,
+      `${fmt(robot.command.vx)}, ${fmt(robot.command.vy)} m/s / ${fmt(robot.command.wz)} rad/s`,
+      robot.arrived ? "是" : "否"].forEach((text) => {
+        const cell = document.createElement("td"); cell.textContent = text; row.appendChild(cell);
+      });
+    body.appendChild(row);
+  });
+}
+
+async function refreshMotion() {
+  const result = await api("/api/motion");
+  renderMotion(result.motion);
+}
+
+async function captureMotion() {
+  try {
+    const numbers = selectedNumbers();
+    if (!numbers.length) throw new Error("请先选择机器人");
+    const telemetry = await api("/api/telemetry");
+    const targets = {};
+    numbers.forEach((n) => {
+      const robot = telemetry.robots.find((r) => r.number === n);
+      if (!robot?.connected || !robot.aligned || !robot.map_pose || robot.last_pose_age === null || robot.last_pose_age > .6)
+        throw new Error(`#${n} 没有新鲜且已标定的位置`);
+      targets[n] = {x:robot.map_pose.x, y:robot.map_pose.y, yaw:robot.map_pose.yaw};
+    });
+    byId("motionProgram").value = JSON.stringify({speed:.12, yaw_rate:.35, acceleration:.2,
+      position_tolerance:.12, yaw_tolerance:.18, settle_time:.5, min_separation:.8,
+      steps:[{timeout:25, targets}]}, null, 2);
+    setMessage(byId("motionMessage"), "已生成当前位置模板。修改目标或复制 steps 中的段落后执行；模板本身仅保持当前位置。");
+  } catch (error) { setMessage(byId("motionMessage"), error.message, true); }
+}
+
+async function startMotion() {
+  try {
+    const program = JSON.parse(byId("motionProgram").value);
+    await stopJoystick();
+    const result = await api("/api/motion", {method:"POST", body:JSON.stringify({program,
+      confirm_motion:byId("confirmMotion").checked, confirm_formation:byId("confirmFormation").checked})});
+    renderMotion(result.motion);
+    setMessage(byId("motionMessage"), "闭环编排已启动。");
+  } catch (error) { setMessage(byId("motionMessage"), error.message, true); }
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -28,6 +196,7 @@ function selectedNumbers() {
 
 function renderDevices() {
   const container = byId("deviceList");
+  if (container.contains(document.activeElement) && document.activeElement.type === "password") return;
   if (!state.devices.length) {
     container.className = "device-list empty";
     container.textContent = "尚未发现设备";
@@ -37,7 +206,7 @@ function renderDevices() {
   container.className = "device-list";
   container.innerHTML = "";
   state.devices.forEach((device) => {
-    const row = document.createElement("label");
+    const row = document.createElement("div");
     row.className = `device ${device.connected ? "connected" : ""}`;
     const status = device.busy ? "处理中" : device.connected ? "已连接" : "未连接";
     const identity = device.sn
@@ -52,6 +221,7 @@ function renderDevices() {
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.dataset.number = String(device.number);
+    checkbox.setAttribute("aria-label", `选择 Go2 #${device.number}`);
     checkbox.checked = state.selected.has(device.number);
     const number = document.createElement("span");
     number.className = "number";
@@ -68,6 +238,39 @@ function renderDevices() {
     statusPill.className = "status";
     statusPill.textContent = status;
     row.append(checkbox, number, information, statusPill);
+    const keySettings = document.createElement("div");
+    keySettings.className = "device-key";
+    const keyInput = document.createElement("input");
+    keyInput.type = "password";
+    keyInput.autocomplete = "off";
+    keyInput.placeholder = device.has_aes_key ? "密钥已配置；输入新密钥可替换" : "AES 密钥（旧固件可留空）";
+    keyInput.setAttribute("aria-label", `Go2 #${device.number} AES 密钥`);
+    keyInput.value = aesKeyDrafts.get(device.number) || "";
+    keyInput.addEventListener("input", () => aesKeyDrafts.set(device.number, keyInput.value));
+    const saveKey = document.createElement("button");
+    saveKey.textContent = "保存密钥";
+    saveKey.disabled = keyInput.disabled = device.connected || device.busy;
+    saveKey.addEventListener("click", async () => {
+      saveKey.disabled = true;
+      try {
+        const result = await api(`/api/devices/${device.number}/aes-key`, {
+          method: "POST",
+          body: JSON.stringify({ aes_128_key: keyInput.value.trim() }),
+        });
+        aesKeyDrafts.delete(device.number);
+        keyInput.value = "";
+        state.devices = result.devices;
+        saveKey.blur();
+        renderDevices();
+        setMessage(byId("scanMessage"), `Go2 #${device.number} 密钥已${result.device.has_aes_key ? "配置" : "清除"}，可点击连接选中。`);
+      } catch (error) {
+        setMessage(byId("scanMessage"), error.message, true);
+      } finally {
+        saveKey.disabled = false;
+      }
+    });
+    keySettings.append(keyInput, saveKey);
+    row.appendChild(keySettings);
     container.appendChild(row);
   });
 	  container.querySelectorAll("input[type=checkbox]").forEach((checkbox) => {
@@ -84,6 +287,13 @@ async function refresh() {
   const result = await api("/api/devices");
   state.devices = result.devices;
   renderDevices();
+  if (result.storage_error) setMessage(byId("persistenceMessage"), result.storage_error, true);
+}
+
+async function loadSavedSettings() {
+  const result = await api('/api/settings');
+  byId('startupAutoConnect').checked = result.auto_connect_enabled !== false;
+  if (result.storage_error) setMessage(byId('persistenceMessage'), result.storage_error, true);
 }
 
 function poseText(pose) {
@@ -109,14 +319,16 @@ function renderTelemetry() {
     const local = document.createElement("p");
     local.textContent = `local(${robot.pose_topic || "rt/utlidar/robot_pose"}): ${poseText(robot.local_pose)}`;
     const map = document.createElement("p");
-    map.textContent = `map: ${poseText(robot.map_pose)}`;
+    map.textContent = `map: ${poseText(robot.map_pose)} · ${robot.restore_status || ""}`;
     const lidar = robot.lidar || {};
     const voxel = lidar.voxel || {};
     const stateData = lidar.state || {};
     const lidarLine = document.createElement("p");
     lidarLine.textContent = `LiDAR(${lidar.voxel_topic || "rt/utlidar/voxel_map_compressed"}): points=${voxel.point_count || 0}, faces=${voxel.face_count || 0}, cloud_hz=${stateData.cloud_frequency ?? "?"}, dirty=${stateData.dirty_percentage ?? "?"}`;
     const age = document.createElement("p");
-    age.textContent = `pose age=${robot.last_pose_age ?? "?"}s, seq=${robot.sequence}${robot.error ? `, error=${robot.error}` : ""}`;
+    const fresh = robot.connected && robot.last_pose_age !== null && robot.last_pose_age <= 1;
+    age.textContent = `${fresh ? "定位正常" : "定位过期或未连接"} · pose age=${robot.last_pose_age ?? "?"}s · 点云 age=${robot.cloud_age ?? "?"}s · seq=${robot.sequence}${robot.error ? `, error=${robot.error}` : ""}`;
+    if (!fresh) age.style.color = "#b63326";
     card.append(title, local, map, lidarLine, age);
     container.appendChild(card);
   });
@@ -128,8 +340,9 @@ function drawSharedMap() {
   const ctx = canvas.getContext("2d");
   ctx.fillStyle = "#17221f";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  const robots = state.telemetry.filter((robot) => robot.map_pose);
-  const points = state.mapPoints || [];
+  const preview = alignmentPreview ? previewScene() : null;
+  const robots = preview ? preview.robots : state.telemetry.filter((robot) => robot.map_pose);
+  const points = preview ? preview.points : state.mapPoints || [];
   const all = [
     ...points.map((point) => ({ x: point.x, y: point.y })),
     ...robots.map((robot) => ({ x: robot.map_pose.x, y: robot.map_pose.y })),
@@ -145,18 +358,22 @@ function drawSharedMap() {
   const minY = Math.min(...all.map((item) => item.y));
   const maxY = Math.max(...all.map((item) => item.y));
   const extent = Math.max(maxX - minX, maxY - minY, 2) * 1.2;
-  const centerX = (minX + maxX) / 2;
-  const centerY = (minY + maxY) / 2;
-  const scale = Math.min(canvas.width, canvas.height) / extent;
+  let centerX = (minX + maxX) / 2;
+  let centerY = (minY + maxY) / 2;
+  let scale = Math.min(canvas.width, canvas.height) / extent;
+  if (alignmentPreview?.done) {
+    if (!alignmentView) alignmentView = {centerX, centerY, scale};
+    ({centerX, centerY, scale} = alignmentView);
+  }
   const toScreen = (x, y) => [
-    canvas.width / 2 + (y - centerY) * scale,
+    canvas.width / 2 - (y - centerY) * scale,
     canvas.height / 2 - (x - centerX) * scale,
   ];
   ctx.strokeStyle = "#354542";
   ctx.lineWidth = 1;
   for (let x = 50; x < canvas.width; x += 50) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke(); }
   for (let y = 50; y < canvas.height; y += 50) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); }
-  const colors = ["#2fe49d", "#ffd15c", "#62a8ff", "#ff7b92", "#d384ff", "#7be0e0"];
+  const colors = ["#2fe49d", "#ffd15c", "#62a8ff", "#ff7b92", "#d384ff", "#7be0e0", "#ffae70"];
   points.forEach((point) => {
     const [x, y] = toScreen(point.x, point.y);
     ctx.fillStyle = colors[(Number(point.number) - 1) % colors.length];
@@ -164,12 +381,21 @@ function drawSharedMap() {
     ctx.fillRect(x, y, 2, 2);
   });
   ctx.globalAlpha = 1;
+  ctx.fillStyle = "#fffefa";
+  ctx.font = "14px sans-serif";
+  ctx.fillText(`${alignmentPreview ? "对齐预览（尚未应用）" : "当前坐标"} · ↑ +X / ← +Y`, 16, 22);
   robots.forEach((robot) => {
     const [x, y] = toScreen(robot.map_pose.x, robot.map_pose.y);
     ctx.fillStyle = colors[(Number(robot.number) - 1) % colors.length];
     ctx.beginPath();
     ctx.arc(x, y, 10, 0, Math.PI * 2);
     ctx.fill();
+    if (alignmentPreview && robot.number === Number(byId("adjustRobot").value)) {
+      ctx.strokeStyle = "#fffefa";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.lineWidth = 1;
+    }
     const yaw = robot.map_pose.yaw;
     const [frontX, frontY] = toScreen(robot.map_pose.x + Math.cos(yaw) * 0.35, robot.map_pose.y + Math.sin(yaw) * 0.35);
     ctx.strokeStyle = "#fffefa";
@@ -190,6 +416,7 @@ async function refreshSharedMap() {
     state.mapPoints = result.points;
     renderTelemetry();
     drawSharedMap();
+    drawFormationPreview();
   } catch (_error) {
     drawSharedMap();
   }
@@ -201,6 +428,7 @@ async function refreshTelemetry(quiet = true) {
     state.telemetry = result.robots;
     renderTelemetry();
     drawSharedMap();
+    drawFormationPreview();
   } catch (error) {
     if (!quiet) setMessage(byId("frameMessage"), error.message, true);
   }
@@ -265,11 +493,12 @@ async function addManual() {
   try {
     const result = await api("/api/devices", {
       method: "POST",
-      body: JSON.stringify({ ip: byId("manualIp").value }),
+      body: JSON.stringify({ ip: byId("manualIp").value, aes_128_key: byId("manualAesKey").value.trim() }),
     });
     state.devices = result.devices;
     state.selected.add(result.device.number);
     byId("manualIp").value = "";
+    byId("manualAesKey").value = "";
     renderDevices();
     setMessage(byId("scanMessage"), `已登记 Go2 #${result.device.number}。`);
   } catch (error) {
@@ -326,7 +555,19 @@ function formationOffsets(numbers, pattern, spacing) {
   const center = (numbers.length - 1) / 2;
   const offsets = {};
   if (pattern === "line") {
-    numbers.forEach((number, index) => { offsets[number] = { x: 0, y: (index - center) * spacing }; });
+    const robots = new Map(state.telemetry.map((robot) => [robot.number, robot]));
+    if (numbers.some((n) => {
+      const robot = robots.get(n);
+      return !robot?.connected || !robot.aligned || !robot.map_pose ||
+        robot.last_pose_age == null || robot.last_pose_age > .6;
+    })) return null;
+    const yaw = robots.get(numbers[0]).map_pose.yaw;
+    const lateral = (n) => {
+      const pose = robots.get(n).map_pose;
+      return -Math.sin(yaw) * pose.x + Math.cos(yaw) * pose.y;
+    };
+    const ordered = [...numbers].sort((a, b) => lateral(a) - lateral(b) || a - b);
+    ordered.forEach((number, index) => { offsets[number] = { x: 0, y: (index - center) * spacing }; });
   } else if (pattern === "column") {
     numbers.forEach((number, index) => { offsets[number] = { x: -index * spacing, y: 0 }; });
   } else if (pattern === "wedge") {
@@ -364,6 +605,12 @@ function drawFormationPreview() {
   }
   const spacing = Number(byId("formationSpacing").value || 0.8);
   const offsets = formationOffsets(numbers, byId("formationPattern").value, spacing);
+  if (!offsets) {
+    ctx.fillStyle = "#91a09a";
+    ctx.font = "16px sans-serif";
+    ctx.fillText("横队预览需要全部选中设备已标定且定位正常", 24, 42);
+    return;
+  }
   const points = Object.values(offsets);
   const xs = points.map((point) => point.x);
   const ys = points.map((point) => point.y);
@@ -376,7 +623,7 @@ function drawFormationPreview() {
   const centerY = (minY + maxY) / 2;
   const scale = Math.min(canvas.width, canvas.height) / extent;
   const toScreen = (point) => [
-    canvas.width / 2 + (point.y - centerY) * scale,
+    canvas.width / 2 - (point.y - centerY) * scale,
     canvas.height / 2 - (point.x - centerX) * scale,
   ];
   ctx.strokeStyle = "#354542";
@@ -400,7 +647,7 @@ function drawFormationPreview() {
   ctx.textBaseline = "alphabetic";
   ctx.fillStyle = "#b6c5bf";
   ctx.font = "12px sans-serif";
-  ctx.fillText("上方为前进方向，#1 为参考点", 14, canvas.height - 14);
+  ctx.fillText(`上方为前进方向，左侧为机身左侧；#${numbers[0]} 当前位姿为基准`, 14, canvas.height - 14);
 }
 
 async function runFormation() {
@@ -656,7 +903,7 @@ function stopJoystick() {
     clearInterval(stickTimer);
     stickTimer = null;
   }
-  if (wasActive) sendCommand("stop", {}, false, true);
+  return wasActive ? sendCommand("stop", {}, false, true) : Promise.resolve();
 }
 
 function configureStick(name, lockVertical = false) {
@@ -702,6 +949,12 @@ function configureStick(name, lockVertical = false) {
 }
 
 byId("scanButton").addEventListener("click", scan);
+byId('startupAutoConnect').addEventListener('change', async () => {
+  try {
+    await api('/api/settings', {method:'POST', body:JSON.stringify({auto_connect_enabled:byId('startupAutoConnect').checked})});
+    setMessage(byId('persistenceMessage'), '启动连接偏好已保存。设备和密钥自动保存；旧标定在连接后经点云验证恢复。');
+  } catch (error) { setMessage(byId('persistenceMessage'), error.message, true); }
+});
 byId("addButton").addEventListener("click", addManual);
 byId("manualIp").addEventListener("keydown", (event) => { if (event.key === "Enter") addManual(); });
 byId("selectAllButton").addEventListener("click", () => { state.devices.forEach((device) => state.selected.add(device.number)); renderDevices(); drawFormationPreview(); });
@@ -711,6 +964,44 @@ byId("disconnectButton").addEventListener("click", () => connectionAction("/api/
 byId("refreshTelemetryButton").addEventListener("click", () => refreshTelemetry(false));
 byId("alignButton").addEventListener("click", alignFrame);
 byId("clearAlignButton").addEventListener("click", clearAlignment);
+byId("autoAlignButton").addEventListener("click", autoAlign);
+byId("applyAutoAlignButton").addEventListener("click", applyAutoAlign);
+byId("cancelAutoAlignButton").addEventListener("click", () => {
+  ++alignmentRequest;
+  alignmentPreview = null;
+  alignmentView = null;
+  byId("autoAlignButton").disabled = false;
+  renderAlignmentResults();
+  drawSharedMap();
+  setMessage(byId("frameMessage"), "已退出预览，现有坐标未改变；后台匹配任务会自行结束。");
+});
+byId("adjustLeft").addEventListener("click", () => adjustPreview(0,.1));
+byId("adjustRight").addEventListener("click", () => adjustPreview(0,-.1));
+byId("adjustForward").addEventListener("click", () => adjustPreview(.1,0));
+byId("adjustBack").addEventListener("click", () => adjustPreview(-.1,0));
+byId("adjustCCW").addEventListener("click", () => adjustPreview(0,0,Math.PI/90));
+byId("adjustCW").addEventListener("click", () => adjustPreview(0,0,-Math.PI/90));
+byId("adjustRobot").addEventListener("change", drawSharedMap);
+byId("acceptAdjustment").addEventListener("click", () => {
+  const r = alignmentPreview?.results.find((item) => item.number === Number(byId("adjustRobot").value));
+  if (!r?.transform) return;
+  r.manualConfirmed = true;
+  renderAlignmentResults();
+});
+byId("sharedMapCanvas").addEventListener("pointerdown", (event) => {
+  if (!alignmentPreview?.done || !alignmentView || !byId("adjustRobot").value) return;
+  alignmentDrag = {x:event.clientX,y:event.clientY};
+  event.currentTarget.setPointerCapture(event.pointerId);
+});
+byId("sharedMapCanvas").addEventListener("pointermove", (event) => {
+  if (!alignmentDrag || !alignmentView) return;
+  const canvas = event.currentTarget, rect = canvas.getBoundingClientRect();
+  const dx = -(event.clientY-alignmentDrag.y)*canvas.height/rect.height/alignmentView.scale;
+  const dy = -(event.clientX-alignmentDrag.x)*canvas.width/rect.width/alignmentView.scale;
+  alignmentDrag = {x:event.clientX,y:event.clientY};
+  adjustPreview(dx,dy);
+});
+["pointerup","pointercancel","lostpointercapture"].forEach((name) => byId("sharedMapCanvas").addEventListener(name, () => {alignmentDrag=null;}));
 byId("videoOnButton").addEventListener("click", () => setVideo(true));
 byId("videoOffButton").addEventListener("click", () => setVideo(false));
 byId("stopButton").addEventListener("click", () => { stopJoystick(); sendCommand("stop", {}, true); });
@@ -718,7 +1009,29 @@ byId("joystickMode").addEventListener("change", () => {
   stopJoystick();
   updateJoystickModeNote();
 });
-byId("formationButton").addEventListener("click", () => { stopJoystick(); runFormation(); });
+byId("formationButton").addEventListener("click", async () => { await stopJoystick(); runFormation(); });
+byId("motionCapture").addEventListener("click", captureMotion);
+byId("motionStart").addEventListener("click", startMotion);
+byId("motionStop").addEventListener("click", async () => {
+  try { renderMotion((await api("/api/motion/stop", {method:"POST"})).motion); }
+  catch (error) { setMessage(byId("motionMessage"), error.message, true); }
+});
+byId("motionImport").addEventListener("change", async (event) => {
+  try {
+    const file = event.target.files[0];
+    if (!file) return;
+    if (file.size > 1000000) throw new Error("编排文件不能超过 1 MB");
+    byId("motionProgram").value = JSON.stringify(JSON.parse(await file.text()), null, 2);
+  } catch (error) { setMessage(byId("motionMessage"), error.message, true); }
+});
+byId("motionExport").addEventListener("click", () => {
+  try {
+    const text = JSON.stringify(JSON.parse(byId("motionProgram").value), null, 2);
+    const url = URL.createObjectURL(new Blob([text], {type:"application/json"}));
+    const a = document.createElement("a"); a.href=url; a.download="closed-loop-program.json"; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { setMessage(byId("motionMessage"), error.message, true); }
+});
 [byId("formationPattern"), byId("formationSpacing"), byId("formationSpeed"), byId("formationTimeout")].forEach((element) => {
   element.addEventListener("input", drawFormationPreview);
   element.addEventListener("change", drawFormationPreview);
@@ -733,9 +1046,11 @@ window.addEventListener("blur", stopJoystick);
 document.addEventListener("visibilitychange", () => { if (document.hidden) stopJoystick(); });
 
 refresh().catch((error) => setMessage(byId("scanMessage"), error.message, true));
+loadSavedSettings().catch((error) => setMessage(byId('persistenceMessage'), error.message, true));
 refreshTelemetry().catch(() => {});
 refreshSharedMap().catch(() => {});
 refreshVideos().catch(() => {});
+refreshMotion().catch(() => {});
 loadCatalog().catch((error) => setMessage(byId("controlMessage"), error.message, true));
 drawFormationPreview();
 drawSharedMap();
@@ -743,3 +1058,4 @@ setInterval(() => refresh().catch(() => {}), 2000);
 setInterval(() => refreshTelemetry().catch(() => {}), 1000);
 setInterval(() => refreshSharedMap().catch(() => {}), 1200);
 setInterval(() => refreshVideos().catch(() => {}), 1000);
+setInterval(() => refreshMotion().catch(() => {}), 500);

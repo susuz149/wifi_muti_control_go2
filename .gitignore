@@ -1,11 +1,22 @@
-__pycache__/
-*.py[cod]
+# Local robot configuration, including device credentials and map snapshots.
+.local_state/
+.env
+.env.*
+
+# Python environments and generated caches.
 .venv/
 venv/
 env/
-.env
-.DS_Store
-*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Build output, logs and editor backup files.
 dist/
 build/
-*.egg-info/
+*.log
+*.bak
+*.bak_*
+*~
+.DS_Store

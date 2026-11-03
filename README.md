@@ -2,7 +2,7 @@
 
 Browser-based multi-robot controller for Unitree Go2 Air on the same Wi-Fi LAN.
 
-This project uses `unitree_webrtc_connect` over LocalSTA WebRTC data channels. It is intended for Go2 firmware below `1.1.15`, where LAN control does not require a per-device AES key.
+This project uses `unitree_webrtc_connect` over LocalSTA WebRTC data channels. Firmware `>= 1.1.15` can use a per-device AES key entered in the device list; older firmware can leave it empty.
 
 ## Features
 
@@ -72,7 +72,7 @@ The UI deliberately blocks normal motion until the safety checkbox is enabled. H
 - Default joystick channel is `rt/wirelesscontroller`. The UI can switch to `rt/api/sport/request` `Move` for direct control.
 - Closed-loop formation uses direct velocity commands and currently does not constitute a full multi-robot path planner; run it only in a verified clear area.
 - `ARCHITECTURE_CN.md` documents the intended split for future shared-map localization, automatic planning, and swappable formation algorithms.
-- For Go2 firmware `>= 1.1.15`, Unitree LAN signaling may require a per-device AES key. This project is currently scoped for firmware `< 1.1.15`.
+- For Go2 firmware `>= 1.1.15`, configure each robot's own AES key before connecting.
 
 ---
 
@@ -80,7 +80,7 @@ The UI deliberately blocks normal motion until the safety checkbox is enabled. H
 
 这是一个通过浏览器控制多台 Unitree Go2 Air 的局域网 Web 控制台。
 
-项目使用 `unitree_webrtc_connect` 的 LocalSTA WebRTC data channel。当前面向 Go2 固件小于 `1.1.15` 的旧固件流程，这类固件的局域网连接通常不需要 per-device AES key。
+项目使用 `unitree_webrtc_connect` 的 LocalSTA WebRTC data channel。旧固件通常不需要密钥；固件 `>= 1.1.15` 可在手动添加设备时填写该设备的 32 位十六进制 AES 密钥，也可在扫描后的设备列表中输入并点击“保存密钥”，再连接。每台设备使用各自的密钥；已连接设备需先断开才能修改。设备编号、IP、SN 和密钥自动保存在本机 `.local_state/fleet.json`，重启后自动加载。文件权限为 `0600`，目录为 `0700`，该路径已加入 Git 忽略；密钥是本机明文保存，页面不返回原文。留空保存会清除页面设置的密钥；此前配置的 `GO2_AES_<IP下划线形式>` 环境变量仍作为后备值。
 
 完整中文安装步骤见 [INSTALL_CN.md](INSTALL_CN.md)。
 
@@ -109,6 +109,7 @@ The UI deliberately blocks normal motion until the safety checkbox is enabled. H
 - 按机器人编号/IP 隔离 `rt/utlidar/robot_pose`、LiDAR 状态和压缩 voxel 数据。
 - 支持逐台设置 `T_map_local`，将多台扫描内容显示在共同 `map frame` 中。
 - 支持基于每台实时 `map_pose` 的闭环列队。
+- 横队按参考狗朝向下的实时横向位置分配目标，保留当前左右顺序；页面“间距 m”控制相邻目标中心距离。编号最小者的当前位置作为队形中心、朝向作为基准，两台都可能移动。其余队形仍按编号分配。
 - 支持网页按编号打开每台 Go2 的视频。
 
 ## 快速安装
@@ -125,6 +126,38 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+## 目标位置闭环编排
+
+页面新增“目标位置闭环编排”：连接机器人并完成公共 map 坐标标定后，勾选参与设备，点击“读取选中位置生成模板”。生成的模板目标就是当前位置，不会自行开始移动。修改目标或在 `steps` 中追加段落，勾选真机动作确认和列队区域确认后点击“执行闭环编排”。JSON 可导入、导出保存，导入不会执行。
+
+每段的 `targets` 用机器人编号作为键，包含 `x`、`y`（map 坐标，米）和 `yaw`（弧度，范围 -π～π）。每段必须包含相同编号；需要等待的狗也填写其保持位置。`timeout` 是单段最长执行时间，不是要求到达的演出时刻。
+
+```json
+{
+  "speed": 0.12,
+  "yaw_rate": 0.35,
+  "acceleration": 0.2,
+  "position_tolerance": 0.12,
+  "yaw_tolerance": 0.18,
+  "settle_time": 0.5,
+  "min_separation": 0.8,
+  "steps": [
+    {"timeout": 25, "targets": {"1": {"x": 0.5, "y": 0, "yaw": 0}}},
+    {"timeout": 25, "targets": {"1": {"x": 0.5, "y": 0.5, "yaw": 0}}}
+  ]
+}
+```
+
+上例仅用于说明格式，假设 #1 从场地原点出发；实际使用应从当前位置模板修改。每段最多移动 4 米，速度上限 0.25 m/s。控制器约每 0.1 秒根据位置和朝向误差计算机身速度，限制平移速度与速度变化；全体在容差内持续稳定后进入下一段。页面显示最近的实际位置、目标、误差、到位状态及速度指令；速度指令并非实测速度。
+
+同一时间只允许一项闭环任务；参与狗不能同时接收手动移动或表演命令。原有自动列队也使用同一执行器。点击“停止整组编排”，或向任意参与狗发送停止命令，会取消整个编排并尝试向所有参与狗发送零速度和停止指令。断开参与狗前也会先停止整组。停止未确认会单独显示，不能将断连等同于机器人已物理停止。启动应用、读取模板、导入编排和查看状态均不启动闭环移动。
+
+执行前保守检查各参与狗的直线路段最小距离，拒绝路线交叉或距离不足；执行时检查实际机间距离。位置反馈超过 0.6 秒未更新、坐标标定改变、相邻控制周期定位跳变、任何一段超时或参与狗间距不足，都会终止整组。此检查不规划绕行，也不覆盖非参与设备、场地障碍物或机器人的完整机身轮廓。当前使用 Sport Move 直接通道，不能依赖自由避障过滤。
+
+这是“目标点序列＋全体到位同步”的第一版，尚未实现按音乐时钟连续轨迹跟踪、舞蹈完成反馈或绝对定位纠偏。初始标定后的 map_pose 仍可能漂移，不能仅靠该控制器保证长期场地绝对精度。已有模拟反馈和接口测试，实机位置精度、制动距离和多机稳定性仍需验证。
+
+接口：`POST /api/motion` 接收 `{program, confirm_motion: true, confirm_formation: true}`，快速返回启动状态；`GET /api/motion` 查询进度；`POST /api/motion/stop` 取消整组任务，无需动作确认。关闭浏览器不会自动取消后台任务。
 
 ## 启动
 
@@ -178,7 +211,28 @@ http://127.0.0.1:8090
 
 ### 固件 1.1.15 或更高版本
 
-Go2 新固件可能需要 per-device AES key 才能进行局域网 WebRTC 握手。本项目当前主要面向 `< 1.1.15`。
+Go2 新固件需要 per-device AES key 时，可在手动添加设备或扫描后的设备列表中填写，并保存后连接。密钥不自动获取，需使用绑定账号等受支持的方式自行取得。
+
+### 自动对齐坐标
+
+1. 连接设备并勾选需要对齐的机器。默认参考狗为 `192.168.31.191`，它会自动加入此次对齐。
+2. 在同一平地保持机器人静止，让它们看到足够多的共同墙面、柱子等静态环境。
+   页面默认启用同向横排布局：以 `.191` 为中心，左侧由近到远 `.214、.120、.103`，右侧由近到远 `.142、.113、.232`，相邻机身中心间距 0.5～0.8 米。左右以参考狗头朝向为准。可编辑列表和间距，摆放不同请关闭该约束。
+3. 点击“自动对齐选中设备”。参考狗在采样时的位置和朝向定义为公共原点和 +X。
+4. 检查彩色点云预览、重叠比例和匹配误差。选择设备后可在图上拖动点云，或用按钮平移、旋转；人工确认调整结果。
+5. 点击“应用预览”。此操作替换全部旧标定；未通过且未经人工确认的设备保持未标定。预览本身不发送运动指令，也不改变现有坐标。
+
+算法使用各台设备独立的米制 native voxel 点云。开启摆放布局后，按实际机身位置和朝向限制 ICP 搜索，并校验左右顺序及相邻间距；不会将不同机器的 local 原点当作机身位置。关闭布局时使用二维占据相关做全局旋转/平移搜索，再用裁剪 ICP 精调。布局估计不能替代点云验证，匹配失败会保持未通过。仅适用于共同平面，不能估计坡度和完整三维姿态。重叠不足、对称或重复环境可能无法可靠对齐，质量分数不代表真实定位误差保证。没有变换候选的设备需恢复数据后重新生成预览，或使用备用手动标定。
+
+定位超过 1 秒、点云超过 3 秒未更新时禁止应用；预览超过 5 分钟或设备重连后失效。应用后仍依赖各台狗自己的持续定位，未实现运行中的持续重定位与漂移校正。当前列队仍不具备多机路径冲突消解能力。
+
+### 启动直连与恢复标定
+
+首次更新后，连接设备并完成一次有效标定（应用预览或手动标定）。程序会保存各台机器的地图点云；正常退出前也会保存最新可用数据。
+
+下次启动程序会自动连接保存的设备，再用新点云和保存的地图做重新定位，验证通过后恢复到原公共坐标系。即使机器狗的 local 原点发生变化，也会计算新的坐标转换；不会直接信任旧坐标值。重叠不足、场景改变、匹配有歧义或数据过期时，保持未对齐并显示原因，需要重新对齐。启动、重连和恢复均不发送运动指令，也不会自动执行列队。
+
+“启动程序时自动连接已保存设备”可关闭；`./run.sh --no-auto-connect` 仅跳过本次自动连接。程序正常退出保留下次直连偏好，页面主动断开的设备不再参与下次自动连接，手动连接成功后重新启用。启动自动连接只尝试一次，离线设备可稍后点击连接；机器狗 IP 变化时需要更新地址。浏览器刷新只读取状态，不重复创建连接。
 
 ## 开发检查
 
@@ -186,4 +240,6 @@ Go2 新固件可能需要 per-device AES key 才能进行局域网 WebRTC 握手
 python3 -m py_compile app.py
 python3 app.py --help
 node --check wifi_web/static/app.js
+python3 -m unittest discover -s tests -v
+node tests/test_alignment_ui.js
 ```
