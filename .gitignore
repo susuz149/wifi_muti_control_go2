@@ -20,3 +20,6 @@ build/
 *.bak_*
 *~
 .DS_Store
+
+# Local source backups
+/backup_sync_*/
