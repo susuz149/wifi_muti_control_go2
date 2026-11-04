@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Go2 Air Wi-Fi 控制台</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <header>
+      <div>
+        <p class="eyebrow">LOCALSTA / WEBRTC DATA CHANNEL</p>
+        <h1>Go2 Air 多机控制台</h1>
+        <p class="subtitle">局域网扫描、编号连接与分组运动控制。音频通道已禁用。</p>
+      </div>
+      <div class="badge"><span id="connectedCount">0</span> 台已连接</div>
+    </header>
+
+    <main>
+      <section class="panel discovery">
+        <div class="panel-title">
+          <h2>设备发现</h2>
+          <button id="scanButton" class="primary">扫描当前 Wi-Fi</button>
+        </div>
+        <label class="inline"><input id="autoConnect" type="checkbox"> 扫描后自动连接发现的候选设备并验证为 Go2</label>
+        <label class="inline"><input id="startupAutoConnect" type="checkbox" checked> 启动程序时自动连接已保存设备</label>
+        <p id="persistenceMessage" class="message">设备和密钥自动保存在本机；连接后自动用新点云验证并恢复已保存标定。匹配不足时会提示重新对齐。</p>
+        <label class="field">扫描网段
+          <input id="scanSubnet" value="192.168.12.0/24" placeholder="192.168.12.0/24">
+        </label>
+        <div class="manual">
+          <input id="manualIp" placeholder="手动输入 IP，例如 192.168.12.14">
+          <input id="manualAesKey" type="password" autocomplete="off" aria-label="设备 AES 密钥" placeholder="AES 密钥（可选，32 位十六进制）">
+          <button id="addButton">添加设备</button>
+        </div>
+        <p class="message">固件 ≥ 1.1.15 可填写每台狗各自的 AES 密钥；旧固件留空。扫描发现后也可在设备列表中设置。密钥保存在本机仅当前用户可读写的配置文件中。</p>
+        <p id="scanMessage" class="message">扫描结果将按发现顺序编号；端口候选连接成功后才确认为 Go2。</p>
+      </section>
+
+      <section class="panel robots">
+        <div class="panel-title">
+          <h2>机器人编号与选择</h2>
+          <div class="actions">
+            <button id="selectAllButton">全选</button>
+            <button id="selectNoneButton">清空</button>
+            <button id="connectButton">连接选中</button>
+            <button id="disconnectButton">断开选中</button>
+          </div>
+        </div>
+        <div id="deviceList" class="device-list empty">尚未发现设备</div>
+      </section>
+
+      <section class="panel control">
+        <div class="panel-title">
+          <div>
+            <h2>选中设备控制</h2>
+            <p class="message">动作仅发送到列表中勾选的编号；可单选、任意多选或全选。</p>
+          </div>
+          <button id="stopButton" class="stop">全部紧急停止</button>
+        </div>
+
+        <div class="safety">
+          <label><input id="confirmMotion" type="checkbox"> 已确认机器人周围安全，允许向选中设备发送真机动作</label>
+          <label class="danger-check"><input id="confirmHighRisk" type="checkbox"> 单独允许高风险动作：空翻、跳跃、直立/倒立、卸力</label>
+        </div>
+
+        <div class="settings">
+          <label>平移速度 m/s <input id="speed" type="number" min="0.01" max="0.5" step="0.01" value="0.15"></label>
+          <label>转速 rad/s <input id="yawRate" type="number" min="0.01" max="1" step="0.01" value="0.35"></label>
+          <label>脉冲时长 s <input id="duration" type="number" min="0.05" max="1" step="0.05" value="0.25"></label>
+          <label>手控通道
+            <select id="joystickMode">
+              <option value="wireless">无线遥控器输入（默认，走机载避障）</option>
+              <option value="sport">Sport Move（直接速度命令）</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="remote">
+          <div class="remote-top">
+            <span>GO2 REMOTE</span>
+            <button data-command="stop" class="stop compact">停止选中</button>
+          </div>
+          <div class="sticks">
+            <div class="stick-set">
+              <p>左摇杆</p>
+              <div id="leftStick" class="stick" aria-label="左摇杆，前后与侧移">
+                <span class="axis-y">前</span><span class="axis-x left">左</span><span class="axis-x right">右</span><span class="axis-y bottom">后</span>
+                <div class="knob"></div>
+              </div>
+              <small>前后 / 侧移</small>
+            </div>
+            <div class="stick-readout">
+              <span>vx <b id="vxValue">0.00</b></span>
+              <span>vy <b id="vyValue">0.00</b></span>
+              <span>wz <b id="wzValue">0.00</b></span>
+            </div>
+            <div class="stick-set">
+              <p>右摇杆</p>
+              <div id="rightStick" class="stick" aria-label="右摇杆，左右转向">
+                <span class="axis-x left">左转</span><span class="axis-x right">右转</span>
+                <div class="knob"></div>
+              </div>
+              <small>转向</small>
+            </div>
+          </div>
+          <p id="joystickModeNote" class="message deadman">拖动期间持续发指令；释放摇杆或窗口失焦立即发送停止。</p>
+        </div>
+        <p id="controlMessage" class="message"></p>
+      </section>
+
+      <section class="panel frame-panel">
+        <div class="panel-title">
+          <div>
+            <h2>自动坐标对齐与 LiDAR 状态</h2>
+            <p class="message">让机器人在同一平地静止，扫描共同墙面、柱子等环境。以参考狗当前的位置为原点、朝向为 +X，自动匹配选中机器的点云；检查预览后应用。不会移动机器人。</p>
+          </div>
+          <button id="refreshTelemetryButton">刷新状态</button>
+        </div>
+        <div class="frame-settings">
+          <label>参考狗 IP <input id="referenceIp" value="192.168.31.191" aria-label="参考狗 IP"></label>
+          <button id="autoAlignButton" class="primary">自动对齐选中设备</button>
+          <button id="applyAutoAlignButton" disabled>应用预览</button>
+          <button id="cancelAutoAlignButton">退出预览</button>
+        </div>
+        <label class="inline"><input id="layoutEnabled" type="checkbox" checked> 使用已知摆放布局：同向横排，左右以参考狗头朝向为准</label>
+        <div class="frame-settings">
+          <label>左侧由近到远（IP 或末段）<input id="layoutLeftIps" value="214, 120, 103"></label>
+          <label>右侧由近到远（IP 或末段）<input id="layoutRightIps" value="142, 113, 232"></label>
+          <label>相邻机身中心最小间距 m <input id="layoutMinSpacing" type="number" min="0.3" max="2" step="0.05" value="0.5"></label>
+          <label>相邻机身中心最大间距 m <input id="layoutMaxSpacing" type="number" min="0.3" max="2" step="0.05" value="0.8"></label>
+        </div>
+        <p class="message">布局只限定点云匹配的搜索范围，实际位置仍需点云验证。前后偏差允许 ±0.4m，同向偏差允许 ±20°；摆放改变后请更新列表，或关闭布局约束。</p>
+        <p class="message">对齐需要新鲜定位和重叠点云。定位过期的设备会跳过；匹配不足时可微调预览。应用会替换全部旧标定，未通过的设备需重新对齐。</p>
+        <div id="alignmentResults" class="alignment-results"></div>
+        <div id="alignmentEditor" class="frame-settings" hidden>
+          <label>微调设备 <select id="adjustRobot"></select></label>
+          <button id="adjustLeft">← 左移 0.1m</button><button id="adjustRight">右移 0.1m →</button>
+          <button id="adjustForward">↑ 前移 0.1m</button><button id="adjustBack">后移 0.1m ↓</button>
+          <button id="adjustCCW">逆时针 2°</button><button id="adjustCW">顺时针 2°</button>
+          <button id="acceptAdjustment">确认该设备的预览</button>
+        </div>
+        <details>
+        <summary>手动坐标标定（备用）</summary>
+        <div class="frame-settings">
+          <label>编号 <input id="alignNumber" type="number" min="1" step="1" value="1"></label>
+          <label>map x <input id="alignX" type="number" step="0.05" value="0"></label>
+          <label>map y <input id="alignY" type="number" step="0.05" value="0"></label>
+          <label>map z <input id="alignZ" type="number" step="0.05" value="0"></label>
+          <label>map yaw(rad) <input id="alignYaw" type="number" step="0.01" value="0"></label>
+          <button id="alignButton" class="primary">标定该编号</button>
+          <button id="clearAlignButton">清除选中标定</button>
+        </div>
+        </details>
+        <div id="frameList" class="frame-list empty">连接机器人后显示各自 local/map pose 和 LiDAR 统计。</div>
+        <div class="shared-map">
+          <canvas id="sharedMapCanvas" width="1000" height="420"></canvas>
+          <p id="mapModeNote" class="message">颜色按机器人编号区分；预览时可拖动所选设备的点云，或用按钮移动、旋转。平地对齐仅计算水平位置和朝向。</p>
+        </div>
+        <p id="frameMessage" class="message"></p>
+      </section>
+
+      <section class="panel video-panel">
+        <div class="panel-title">
+          <div>
+            <h2>单机视频</h2>
+            <p class="message">视频按编号单独开启；每个画面只读取该编号对应的 WebRTC video track。</p>
+          </div>
+          <div class="actions">
+            <button id="videoOnButton" class="primary">开启选中视频</button>
+            <button id="videoOffButton">关闭选中视频</button>
+          </div>
+        </div>
+        <div id="videoList" class="video-list empty">连接并开启视频后显示画面。</div>
+        <p id="videoMessage" class="message"></p>
+      </section>
+
+      <section class="panel formation-panel">
+        <div class="panel-title">
+          <div>
+            <h2>自动列队</h2>
+            <p class="message">横队按当前位置保留左右顺序，其余队形按编号分配位置；需要先完成 map frame 标定，执行时按实时 map_pose 闭环修正。</p>
+          </div>
+          <button id="formationButton" class="primary">执行列队</button>
+        </div>
+
+        <div class="safety formation-safety">
+          <label><input id="confirmFormation" type="checkbox"> 已确认队形区域空旷且坐标已标定，允许执行闭环列队</label>
+        </div>
+
+        <div class="settings formation-settings">
+          <label>队形
+            <select id="formationPattern">
+              <option value="line">横队</option>
+              <option value="column">纵队</option>
+              <option value="wedge">楔形</option>
+              <option value="grid">方阵</option>
+            </select>
+          </label>
+          <label>间距 m <input id="formationSpacing" type="number" min="0.3" max="2" step="0.1" value="0.8"></label>
+          <label>列队速度 m/s <input id="formationSpeed" type="number" min="0.03" max="0.25" step="0.01" value="0.12"></label>
+          <label>超时 s <input id="formationTimeout" type="number" min="5" max="60" step="1" value="25"></label>
+        </div>
+
+        <div class="formation-preview">
+          <canvas id="formationCanvas" width="620" height="300"></canvas>
+          <p class="message">以选中编号最小者的当前位置和朝向为基准生成目标。横队保留当前左右顺序，队形中心位于该基准位置，两台都可能移动；间距为相邻目标中心的距离。</p>
+        </div>
+        <p id="formationMessage" class="message"></p>
+      </section>
+
+      <section class="panel motion-panel">
+        <div class="panel-title">
+          <div><h2>目标位置闭环编排</h2>
+            <p class="message">坐标使用已标定的 map frame，单位米；yaw 使用弧度。全体稳定到位后进入下一段。</p></div>
+        </div>
+        <p class="message">先勾选机器人，再读取当前位置生成模板。模板不会移动机器人；修改目标后再执行。每段需包含相同编号。路线距离检查仅覆盖参与机器，不包含障碍物和未参与设备。</p>
+        <div class="actions">
+          <button id="motionCapture">读取选中位置生成模板</button>
+          <button id="motionExport">导出 JSON</button>
+          <label>导入 JSON <input id="motionImport" type="file" accept=".json,application/json"></label>
+        </div>
+        <label for="motionProgram">目标点编排 JSON</label>
+        <textarea id="motionProgram" rows="15" spellcheck="false" placeholder="先读取选中机器人的当前位置"></textarea>
+        <div class="actions">
+          <button id="motionStart" class="primary">执行闭环编排</button>
+          <button id="motionStop" class="danger">停止整组编排</button>
+        </div>
+        <p id="motionMessage" class="message" role="status"></p>
+        <p id="motionStatus" class="message" role="status"></p>
+        <div class="motion-table-wrap"><table class="motion-table">
+          <thead><tr><th>编号</th><th>实际位置 / 朝向</th><th>目标位置 / 朝向</th><th>误差</th><th>速度指令（机身坐标）</th><th>到位</th></tr></thead>
+          <tbody id="motionRobots"></tbody>
+        </table></div>
+        <p class="message">速度列为发送的控制指令，并非实测速度。暂停编排后请检查位置再重新执行；此版本不保证与音乐定时同步，也不自动绕障。</p>
+      </section>
+
+      <section class="panel sdk-panel">
+        <div class="panel-title sdk-title">
+          <div>
+            <h2>Sport SDK 动作目录</h2>
+            <p class="message">显示已安装 `unitree_webrtc_connect` 提供的全部动作 API；动作会发送到当前勾选的编号。</p>
+          </div>
+          <label class="profile">协议模式
+            <select id="sportProfile"></select>
+          </label>
+        </div>
+        <div id="profileNote" class="profile-note"></div>
+        <div id="sportCatalog" class="catalog"></div>
+      </section>
+    </main>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>

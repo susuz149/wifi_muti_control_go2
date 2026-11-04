@@ -45,7 +45,11 @@ def parse_program(data):
         if participants is not None and set(targets) != participants:
             raise ValueError('每段必须包含相同的机器人编号；等待的机器人也应填写目标位置')
         participants = set(targets)
-        steps.append({'targets': targets, 'timeout': number(step, 'timeout', 25, 5, 120)})
+        duration = number(step, 'duration', 0, 0, 110)
+        timeout = number(step, 'timeout', 25, 5, 120)
+        if duration and duration + settings['settle_time'] >= timeout:
+            raise ValueError('timeout 必须大于 duration + settle_time')
+        steps.append({'targets': targets, 'timeout': timeout, 'duration': duration})
     return dict(settings, steps=steps)
 
 
@@ -160,6 +164,7 @@ class MotionRunner:
             self.state['stop_error'] = '停止指令未确认：' + '; '.join(failures)
 
     async def _run(self, program, initial):
+        sessions = {n: item.get('session') for n, item in initial.items()}
         transforms = {n: copy.deepcopy(item['transform']) for n, item in initial.items()}
         previous = {n: (0.,0.,0.) for n in initial}
         last_poses = {n: dict(item['pose']) for n, item in initial.items()}
@@ -168,7 +173,16 @@ class MotionRunner:
                 self.state['step'] = index
                 starts = {n: item['pose'] for n, item in self.poses(self.participants).items()}
                 self.check_paths(starts, step['targets'], program['min_separation'])
-                deadline, settled = time.monotonic()+step['timeout'], None
+                start_time = time.monotonic()
+                deadline, settled = start_time+step['timeout'], None
+                next_tick = start_time
+                settle_sequences = None
+                duration = step.get('duration', 0)
+                if duration:
+                    for n, target in step['targets'].items():
+                        distance = math.hypot(target['x']-starts[n]['x'], target['y']-starts[n]['y'])
+                        if 6*distance/duration**2 > program['acceleration'] or 6*abs(angle(target['yaw']-starts[n]['yaw']))/duration**2 > 1. or 1.5*distance/duration > program['speed'] or 1.5*abs(angle(target['yaw']-starts[n]['yaw']))/duration > program['yaw_rate']:
+                            raise ValueError('同步段 duration 太短，请增加时长或缩短距离')
                 previous_time = time.monotonic()-.1
                 while True:
                     now = time.monotonic()
@@ -180,13 +194,30 @@ class MotionRunner:
                     all_arrived, commands = True, {}
                     for n, item in items.items():
                         pose, target = item['pose'], step['targets'][n]
-                        if item['transform'] != transforms[n]:
+                        if item.get('session') != sessions[n] or item['transform'] != transforms[n]:
                             raise ValueError(f'#{n} 坐标标定已改变')
                         if math.hypot(pose['x']-last_poses[n]['x'], pose['y']-last_poses[n]['y']) > .4 or abs(angle(pose['yaw']-last_poses[n]['yaw'])) > .6:
                             raise ValueError(f'#{n} 定位跳变，请重新检查定位')
                         last_poses[n] = dict(pose)
                         command, distance, heading = velocity(pose, target, program['speed'], program['yaw_rate'])
-                        arrived = distance <= program['position_tolerance'] and abs(heading) <= program['yaw_tolerance']
+                        if duration and now-start_time < duration:
+                            u = max(0., min(1., (now-start_time)/duration))
+                            fraction, rate = u*u*(3-2*u), 6*u*(1-u)/duration
+                            origin = starts[n]
+                            ref = {k: origin[k] + fraction*(target[k]-origin[k]) for k in ('x','y')}
+                            ref['yaw'] = angle(origin['yaw'] + fraction*angle(target['yaw']-origin['yaw']))
+                            if math.hypot(ref['x']-pose['x'], ref['y']-pose['y']) > .35:
+                                raise ValueError(f'#{n} 同步轨迹跟踪误差超过 0.35 米')
+                            if abs(angle(ref['yaw']-pose['yaw'])) > .5:
+                                raise ValueError(f'#{n} 同步轨迹朝向误差超过 0.5 弧度')
+                            correction, _, _ = velocity(pose, ref, program['speed'], program['yaw_rate'])
+                            c, sn = math.cos(pose['yaw']), math.sin(pose['yaw'])
+                            fx, fy = rate*(target['x']-origin['x']), rate*(target['y']-origin['y'])
+                            vx, vy = correction[0]+c*fx+sn*fy, correction[1]-sn*fx+c*fy
+                            cap = min(1., program['speed']/max(math.hypot(vx,vy),1e-9))
+                            wz = correction[2]+rate*angle(target['yaw']-origin['yaw'])
+                            command = (vx*cap, vy*cap, max(-program['yaw_rate'], min(program['yaw_rate'], wz)))
+                        arrived = (not duration or now-start_time >= duration) and distance <= program['position_tolerance'] and abs(heading) <= program['yaw_tolerance']
                         all_arrived &= arrived
                         if arrived:
                             command = (0.,0.,0.)
@@ -205,11 +236,18 @@ class MotionRunner:
                         self.send(n, *command)
                     if all_arrived:
                         settled = now if settled is None else settled
-                        if now-settled >= program['settle_time']:
+                        if settle_sequences is None:
+                            settle_sequences = {n: item.get('sequence') for n, item in items.items()}
+                        fresh = all(item.get('sequence') is None or item['sequence'] != settle_sequences[n] for n, item in items.items())
+                        if now-settled >= program['settle_time'] and fresh:
                             break
                     else:
                         settled = None
-                    await asyncio.sleep(.1)
+                        settle_sequences = None
+                    next_tick += .1
+                    if next_tick < time.monotonic():
+                        next_tick = time.monotonic() + .1
+                    await asyncio.sleep(max(0., next_tick-time.monotonic()))
             self.state['status'] = 'completed'
         except asyncio.CancelledError:
             self.state['status'] = 'cancelled'

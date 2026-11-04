@@ -63,8 +63,70 @@ class MotionAPITests(unittest.TestCase):
 
 
 class CommandOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.service = app.MultiGo2Service.__new__(app.MultiGo2Service)
+        self.service.pending_motion_commands = {}
+        self.service.stopping_numbers = {}
+        self.service.control_tasks = {}
+        self.service.joystick_deadmen = {}
+        self.service.action_until = {}
+        self.service.motion = SimpleNamespace(active=False)
+        self.service.connected_connections = lambda numbers: [(n, None) for n in numbers]
+        self.service._sport_request = AsyncMock(return_value=None)
+
+    async def test_default_allows_consecutive_actions_without_waiting(self):
+        parameters = app.sport_action_parameters({'action': 'StandUp'})
+        self.assertEqual(parameters['hold_seconds'], 0.)
+        for _ in range(2):
+            result = await self.service.command([1], 'sport_action', parameters)
+            self.assertTrue(result[0]['ok'])
+        self.assertEqual(self.service._sport_request.await_count, 2)
+        self.assertEqual(self.service.action_until, {})
+        self.assertEqual(self.service.pending_motion_commands, {})
+
+    async def test_explicit_hold_blocks_motion_but_not_queries_or_stop(self):
+        parameters = app.sport_action_parameters({'action': 'StandUp', 'hold_seconds': 10})
+        await self.service.command([1], 'sport_action', parameters)
+        with self.assertRaisesRegex(ValueError, '保护等待期'):
+            await self.service.command([1], 'sport_action', parameters)
+        query = app.sport_action_parameters({'action': 'GetState'})
+        self.assertTrue((await self.service.command([1], 'sport_action', query))[0]['ok'])
+        self.service._publish_wireless_controller = Mock()
+        self.service._move_without_reply = Mock()
+        await self.service.command([1], 'stop', {})
+        self.assertNotIn(1, self.service.action_until)
+        self.assertTrue((await self.service.command([1], 'sport_action', parameters))[0]['ok'])
+
+    async def test_pending_request_still_blocks_same_robot_only(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def request(*args):
+            entered.set()
+            await release.wait()
+
+        self.service._sport_request.side_effect = request
+        parameters = app.sport_action_parameters({'action': 'StandUp'})
+        first = asyncio.create_task(self.service.command([1], 'sport_action', parameters))
+        await entered.wait()
+        try:
+            with self.assertRaisesRegex(ValueError, '指令在途'):
+                await self.service.command([1], 'sport_action', parameters)
+            # A second robot can dispatch while robot 1 is waiting for a response.
+            self.service._sport_request.side_effect = None
+            self.assertTrue((await self.service.command([2], 'sport_action', parameters))[0]['ok'])
+        finally:
+            release.set()
+            await first
+        self.assertTrue((await self.service.command([1], 'sport_action', parameters))[0]['ok'])
+
+    def test_hold_seconds_accepts_zero_and_rejects_out_of_range(self):
+        self.assertEqual(app.sport_action_parameters({'action': 'StandUp', 'hold_seconds': 0})['hold_seconds'], 0.)
+        for value in (-1, 121):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                app.sport_action_parameters({'action': 'StandUp', 'hold_seconds': value})
+
     async def test_manual_commands_rejected_and_stop_cancels_entire_group(self):
-        service = app.MultiGo2Service.__new__(app.MultiGo2Service)
+        service = self.service
         service.pending_motion_commands = {}
         service.motion = SimpleNamespace(active=True, participants={1, 2}, cancel=AsyncMock())
         service.connected_connections = lambda numbers: [(n, None) for n in numbers]
@@ -76,7 +138,7 @@ class CommandOwnershipTests(unittest.IsolatedAsyncioTestCase):
         service.motion.cancel.assert_awaited_once()
 
     async def test_start_rejects_a_pending_manual_move(self):
-        service = app.MultiGo2Service.__new__(app.MultiGo2Service)
+        service = self.service
         service.pending_motion_commands = {1: 1}
         service.connected_connections = lambda numbers: [(1, None)]
         with self.assertRaisesRegex(ValueError, '手动动作'):

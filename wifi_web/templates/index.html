@@ -214,8 +214,10 @@
           <div><h2>目标位置闭环编排</h2>
             <p class="message">坐标使用已标定的 map frame，单位米；yaw 使用弧度。全体稳定到位后进入下一段。</p></div>
         </div>
-        <p class="message">先勾选机器人，再读取当前位置生成模板。模板不会移动机器人；修改目标后再执行。每段需包含相同编号。路线距离检查仅覆盖参与机器，不包含障碍物和未参与设备。</p>
+        <p class="message">先勾选机器人，再读取当前位置生成模板。模板不会移动机器人；修改目标后再执行。每段需包含相同编号。可添加 duration（秒）启用共同时间进度；timeout 要留出到位修正时间。路线距离检查仅覆盖参与机器，不包含障碍物和未参与设备。</p>
         <div class="actions">
+          <button id="homeCapture">记录选中机器起点</button>
+          <button id="homeReturn">确认站稳后低速回位</button>
           <button id="motionCapture">读取选中位置生成模板</button>
           <button id="motionExport">导出 JSON</button>
           <label>导入 JSON <input id="motionImport" type="file" accept=".json,application/json"></label>
@@ -246,6 +248,8 @@
           </label>
         </div>
         <div id="profileNote" class="profile-note"></div>
+        <label>动作保护等待（秒，0 表示不额外等待）<input id="actionHoldSeconds" type="number" min="0" max="120" value="0" step="0.5"></label>
+        <p class="message">默认在指令请求返回后即可继续下发；同一台机器有运动指令在途时拒绝重复发送。设置保护时间后，从下发时开始计时，期间拒绝新的运动指令；停止可随时中断。请求返回和保护期结束均不代表动作完成，回位前请确认动作结束并站稳。</p>
         <div id="sportCatalog" class="catalog"></div>
       </section>
     </main>

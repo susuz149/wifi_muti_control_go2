@@ -1,5 +1,5 @@
-import os
 #!/usr/bin/env python3
+import os
 """Browser controller for multiple Go2 Air robots on the local Wi-Fi LAN."""
 
 import argparse
@@ -247,6 +247,7 @@ class FrameState:
     aligned: bool = False
     anchor: dict | None = None
     last_pose_time: float = 0.0
+    last_pose_monotonic: float = 0.0
     pose_topic: str = ""
     lidar: dict = field(default_factory=dict)
     map_points: list = field(default_factory=list)
@@ -311,6 +312,10 @@ class MultiGo2Service:
         self.restore_tasks = {}
         self.joystick_deadmen = {}
         self.pending_motion_commands = {}
+        self.control_tasks = {}
+        self.action_until = {}
+        self.stopping_numbers = {}
+        self.return_points = {}
         self.motion = MotionRunner(self._motion_snapshot, self._motion_send, self._motion_stop)
         self.frames = {}
         self.videos = {}
@@ -669,6 +674,7 @@ class MultiGo2Service:
                     frame.local_pose = local_pose
                     frame.map_pose = transform_pose(frame.map_to_local, local_pose)
                     frame.last_pose_time = time.time()
+                    frame.last_pose_monotonic = time.monotonic()
                     frame.pose_topic = topic
                     frame.sequence += 1
                     frame.error = ""
@@ -884,29 +890,65 @@ class MultiGo2Service:
         return [(number, self.connections[number]) for number in numbers]
 
     async def command(self, numbers, name, parameters):
-        if self.motion.active and self.motion.participants.intersection(numbers):
-            if name == 'stop' or (name == 'sport_action' and parameters.get('action') == 'StopMove'):
-                await self.motion.cancel()
-            elif not (name == 'sport_action' and parameters.get('query')):
-                raise ValueError('机器人正在执行闭环编排，请先停止编排再手动控制')
         connections = self.connected_connections(numbers)
-        moving = name in {'move', 'joystick'} or (name == 'sport_action' and not parameters.get('query')
-                                                   and parameters.get('action') != 'StopMove')
-        if moving:
+        stopping = name == 'stop' or (name == 'sport_action' and parameters.get('action') == 'StopMove')
+        moving = not stopping and not (name == 'sport_action' and parameters.get('query'))
+        tasks, owned = [], {}
+        # Reserve stop priority before the first await, including closed-loop cancellation.
+        if stopping:
             for n in numbers:
-                self.pending_motion_commands[n] = self.pending_motion_commands.get(n, 0) + 1
+                self.stopping_numbers[n] = self.stopping_numbers.get(n, 0) + 1
         try:
-            return await asyncio.gather(
-                *(self._command_one(number, conn, name, parameters) for number, conn in connections)
-            )
-        finally:
-            if moving:
+            if self.motion.active and self.motion.participants.intersection(numbers):
+                if stopping:
+                    await self.motion.cancel()
+                elif moving:
+                    raise ValueError('机器人正在执行闭环编排，请先停止编排')
+            if stopping:
+                cancelled = []
                 for n in numbers:
-                    count = self.pending_motion_commands[n] - 1
+                    task = self.control_tasks.get(n)
+                    if task and not task.done():
+                        task.cancel()
+                        cancelled.append(task)
+                    deadman = self.joystick_deadmen.pop(n, None)
+                    if deadman:
+                        deadman.cancel()
+                        cancelled.append(deadman)
+                    self.action_until.pop(n, None)
+                if cancelled:
+                    await asyncio.gather(*cancelled, return_exceptions=True)
+            if moving:
+                busy = [n for n in numbers if n in self.stopping_numbers or n in self.pending_motion_commands or
+                        time.monotonic() < self.action_until.get(n, 0)]
+                if busy:
+                    raise ValueError(f'以下机器人仍在动作保护等待期或有指令在途：{busy}；需要中断时请先停止')
+                for n in numbers:
+                    deadman = self.joystick_deadmen.pop(n, None)
+                    if deadman:
+                        deadman.cancel()
+            # No await between busy check and ownership registration.
+            for n, conn in connections:
+                task = asyncio.create_task(self._command_one(n, conn, name, parameters))
+                tasks.append(task)
+                if moving:
+                    self.pending_motion_commands[n] = 1
+                    self.control_tasks[n] = owned[n] = task
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            return [({'number': n, 'ok': False, 'error': '指令已被停止取消' if isinstance(r, asyncio.CancelledError) else str(r)}
+                     if isinstance(r, BaseException) else r) for (n, _), r in zip(connections, results)]
+        finally:
+            if stopping:
+                for n in numbers:
+                    count = self.stopping_numbers[n] - 1
                     if count:
-                        self.pending_motion_commands[n] = count
+                        self.stopping_numbers[n] = count
                     else:
-                        self.pending_motion_commands.pop(n)
+                        self.stopping_numbers.pop(n, None)
+            for n, task in owned.items():
+                if self.control_tasks.get(n) is task:
+                    self.control_tasks.pop(n, None)
+                    self.pending_motion_commands.pop(n, None)
 
     def _motion_snapshot(self, number):
         with self.lock:
@@ -914,7 +956,8 @@ class MultiGo2Service:
             if not frame or not device:
                 return None
             return {'connected': device.connected and number in self.connections,
-                    'aligned': frame.aligned, 'age': time.time()-frame.last_pose_time,
+                    'session': frame.session, 'sequence': frame.sequence,
+                    'aligned': frame.aligned, 'age': time.monotonic()-frame.last_pose_monotonic,
                     'pose': dict(frame.map_pose or {}), 'transform': dict(frame.map_to_local or {})}
 
     def _motion_send(self, number, vx, vy, wz):
@@ -930,7 +973,7 @@ class MultiGo2Service:
     async def start_motion(self, program):
         numbers = list(program['steps'][0]['targets'])
         self.connected_connections(numbers)
-        if any(n in self.pending_motion_commands for n in numbers):
+        if any(n in self.stopping_numbers or n in self.pending_motion_commands or time.monotonic() < self.action_until.get(n, 0) for n in numbers):
             raise ValueError('参与机器人仍有手动动作指令执行中，请等待完成后再开始闭环编排')
         state = await self.motion.start(program)
         # An old joystick deadman must not stop a newly started controller.
@@ -985,6 +1028,9 @@ class MultiGo2Service:
                  ('' if state['status'] == 'completed' else state['status'])} for n in numbers]
 
     async def _command_one(self, number, conn, name, parameters):
+        if name == 'sport_action' and parameters.get('action') == 'StopMove':
+            name = 'stop'
+        started = time.monotonic()
         try:
             if name == "move":
                 self._move_without_reply(conn, parameters["x"], parameters["y"], parameters["z"])
@@ -1001,6 +1047,12 @@ class MultiGo2Service:
                 self._arm_joystick_deadman(number, conn)
                 response = None
             elif name == "sport_action":
+                if not parameters.get("query"):
+                    hold_seconds = parameters.get("hold_seconds", 0.)
+                    if hold_seconds > 0:
+                        self.action_until[number] = time.monotonic() + hold_seconds
+                    else:
+                        self.action_until.pop(number, None)
                 response = await self._sport_request(
                     conn, parameters["api_id"], parameters.get("parameter")
                 )
@@ -1008,8 +1060,17 @@ class MultiGo2Service:
                 task = self.joystick_deadmen.pop(number, None)
                 if task:
                     task.cancel()
+                self._publish_wireless_controller(conn)
+                self._move_without_reply(conn, 0., 0., 0.)
                 response = await self._sport_request(conn, SPORT_CMD["StopMove"])
-            result = {"number": number, "ok": True}
+            if response is not None:
+                code = nested(response, 'data', 'header', 'status', 'code')
+                if code is None:
+                    code = nested(response, 'header', 'status', 'code')
+                if code is not None and code != 0:
+                    raise ValueError(f'机器人拒绝指令，业务返回码：{code}')
+            result = {"number": number, "ok": True, "dispatch_monotonic": started,
+                      "request_elapsed": round(time.monotonic()-started, 4)}
             if parameters.get("query") and response is not None:
                 result["response"] = response
             return result
@@ -1042,10 +1103,16 @@ class MultiGo2Service:
         options = {"api_id": api_id}
         if parameter is not None:
             options["parameter"] = parameter
-        return await asyncio.wait_for(
+        response = await asyncio.wait_for(
             conn.datachannel.pub_sub.publish_request_new(RTC_TOPIC["SPORT_MOD"], options),
             timeout=3.0,
         )
+        code = nested(response, 'data', 'header', 'status', 'code')
+        if code is None:
+            code = nested(response, 'header', 'status', 'code')
+        if code is not None and code != 0:
+            raise ValueError(f'机器人拒绝指令，业务返回码：{code}')
+        return response
 
     @staticmethod
     def _move_without_reply(conn, x, y, z):
@@ -1486,7 +1553,8 @@ def joystick_parameters(data):
         "x": x,
         "y": y,
         "z": z,
-        "lx": y / MAX_SPEED,
+        # Wireless horizontal stick +X is right; body-frame +Y is left.
+        "lx": -y / MAX_SPEED,
         "ly": x / MAX_SPEED,
         # Wireless right-stick +X is right; Sport positive yaw turns left.
         "rx": -z / MAX_YAW_RATE,
@@ -1541,6 +1609,7 @@ def sport_action_parameters(data):
         "query": parameter_type == "query",
         "action": name,
         "profile": profile_name,
+        "hold_seconds": bounded_float(data, "hold_seconds", 0., 0., 120.),
     }
 
 
@@ -1803,6 +1872,43 @@ def motion_program():
             program = parse_program(data.get('program'))
             state = service.submit(service.start_motion(program), timeout=5.)
         return jsonify(ok=True, motion=state)
+    except (ValueError, TimeoutError) as exc:
+        return payload_error(str(exc))
+
+
+@app.post('/api/motion/home')
+def motion_home():
+    data = request.get_json(silent=True) or {}
+    try:
+        numbers = parse_numbers(data)
+        async def operate():
+            service.connected_connections(numbers)
+            if service.motion.active or any(n in service.stopping_numbers or n in service.pending_motion_commands or
+                    time.monotonic() < service.action_until.get(n, 0) for n in numbers):
+                raise ValueError('请等待动作保护期结束并确认全体站稳后操作')
+            poses = service.motion.poses(numbers)
+            if data.get('operation') == 'capture':
+                for n, item in poses.items():
+                    service.return_points[n] = json.loads(json.dumps(item))
+                return {'captured': numbers}
+            if data.get('operation') != 'return':
+                raise ValueError('未知起点操作')
+            if not all(data.get(k) is True for k in ('confirm_motion', 'confirm_formation', 'confirm_standing')):
+                raise ValueError('请确认动作已结束、全体站稳且回位路线安全')
+            targets = {}
+            for n, item in poses.items():
+                saved = service.return_points.get(n)
+                if not saved or saved.get('session') != item.get('session') or saved['transform'] != item['transform']:
+                    raise ValueError(f'#{n} 起点缺失、重连或标定改变，请重新记录起点')
+                target = saved['pose']
+                if math.hypot(target['x']-item['pose']['x'], target['y']-item['pose']['y']) > .8:
+                    raise ValueError(f'#{n} 回位偏差超过 0.8 米，请人工检查')
+                targets[str(n)] = target
+            program = parse_program({'speed': .08, 'yaw_rate': .2, 'min_separation': .8,
+                                     'steps': [{'targets': targets, 'timeout': 30}]})
+            return {'motion': await service.start_motion(program)}
+        result = service.submit(operate(), timeout=5.)
+        return jsonify(ok=True, **result)
     except (ValueError, TimeoutError) as exc:
         return payload_error(str(exc))
 

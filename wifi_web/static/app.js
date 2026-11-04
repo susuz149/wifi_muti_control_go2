@@ -1,4 +1,4 @@
-const state = { devices: [], selected: new Set(), profiles: {}, telemetry: [], mapPoints: [], videos: {}, joystickInFlight: false };
+const state = { devices: [], selected: new Set(), profiles: {}, telemetry: [], mapPoints: [], videos: {}, controlBusy: false, joystickPromise: null, joystickTargets: [], joystickInFlight: false };
 const sticks = {
   left: { x: 0, y: 0, active: false },
   right: { x: 0, y: 0, active: false },
@@ -167,7 +167,7 @@ async function captureMotion() {
 async function startMotion() {
   try {
     const program = JSON.parse(byId("motionProgram").value);
-    await stopJoystick();
+    if (!(await stopJoystick())) throw new Error("停止未确认，未启动编排");
     const result = await api("/api/motion", {method:"POST", body:JSON.stringify({program,
       confirm_motion:byId("confirmMotion").checked, confirm_formation:byId("confirmFormation").checked})});
     renderMotion(result.motion);
@@ -537,6 +537,7 @@ async function sendCommand(command, extra = {}, all = false, quiet = false) {
         yaw_rate: byId("yawRate").value,
         duration: byId("duration").value,
         joystick_mode: byId("joystickMode").value,
+        hold_seconds: Number(byId("actionHoldSeconds").value),
         ...extra,
       }),
     });
@@ -546,10 +547,12 @@ async function sendCommand(command, extra = {}, all = false, quiet = false) {
     if (!quiet || failures.length) {
       setMessage(byId("controlMessage"), failures.length ? failures.map((item) => `#${item.number}: ${item.error}`).join("; ") : `命令 ${command} 已发送到 ${targets.join(", ")}。`, failures.length > 0);
     }
+    return failures.length === 0;
   } catch (error) {
     setMessage(byId("controlMessage"), error.message, true);
-	  }
-	}
+    return false;
+  }
+}
 
 function formationOffsets(numbers, pattern, spacing) {
   const center = (numbers.length - 1) / 2;
@@ -770,7 +773,7 @@ function makeControl(metadata) {
   const send = document.createElement("button");
   send.textContent = metadata.parameter === "query" ? "读取" : "执行";
   send.disabled = !metadata.enabled;
-  send.addEventListener("click", () => {
+  send.addEventListener("click", async () => {
     const parameters = Object.fromEntries(Object.entries(values).map(([key, getter]) => [key, getter()]));
     const activatesHighRisk = metadata.risk === "high" && !(metadata.parameter === "bool" && parameters.value === false);
     if (activatesHighRisk) {
@@ -780,11 +783,17 @@ function makeControl(metadata) {
       }
       if (!window.confirm(`高风险动作：${metadata.label}。确认对选中的 Go2 执行？`)) return;
     }
-    sendCommand("sport_action", {
+    if (state.controlBusy) return;
+    state.controlBusy = true;
+    send.disabled = true;
+    try {
+      if (metadata.parameter !== "query" && !(await stopJoystick())) return;
+      await sendCommand("sport_action", {
       profile: byId("sportProfile").value,
       action: metadata.name,
       ...parameters,
-    });
+      });
+    } finally { state.controlBusy = false; send.disabled = !metadata.enabled; }
   });
   controls.appendChild(send);
   return controls;
@@ -874,12 +883,13 @@ function updateJoystickModeNote() {
 }
 
 async function publishJoystick() {
-  if (state.joystickInFlight || (!sticks.left.active && !sticks.right.active)) return;
+  if (state.controlBusy || state.joystickInFlight || (!sticks.left.active && !sticks.right.active)) return;
   const velocity = velocityFromSticks();
   showVelocity(velocity);
   state.joystickInFlight = true;
   try {
-    await sendCommand("joystick", velocity, false, true);
+    state.joystickPromise = sendCommand("joystick", {...velocity, targets: state.joystickTargets}, false, true);
+    await state.joystickPromise;
   } finally {
     state.joystickInFlight = false;
   }
@@ -892,18 +902,28 @@ function centerKnob(name) {
   sticks[name].y = 0;
 }
 
+let joystickStopPromise = null;
 function stopJoystick() {
-  const wasActive = sticks.left.active || sticks.right.active;
+  const targets = [...state.joystickTargets];
   sticks.left.active = false;
   sticks.right.active = false;
   centerKnob("left");
   centerKnob("right");
-  showVelocity({ x: 0, y: 0, z: 0 });
-  if (stickTimer) {
-    clearInterval(stickTimer);
-    stickTimer = null;
-  }
-  return wasActive ? sendCommand("stop", {}, false, true) : Promise.resolve();
+  showVelocity({x:0, y:0, z:0});
+  if (stickTimer) { clearInterval(stickTimer); stickTimer = null; }
+  if (joystickStopPromise) return joystickStopPromise;
+  if (!targets.length) return Promise.resolve(true);
+  joystickStopPromise = (async () => {
+    // Stop now, then stop again after any outstanding joystick request has drained.
+    const first = sendCommand("stop", {targets}, false, true);
+    const pending = state.joystickPromise;
+    await first;
+    if (pending) await pending;
+    const ok = await sendCommand("stop", {targets}, false, true);
+    if (ok) state.joystickTargets = [];
+    return ok;
+  })().finally(() => { joystickStopPromise = null; });
+  return joystickStopPromise;
 }
 
 function configureStick(name, lockVertical = false) {
@@ -925,10 +945,12 @@ function configureStick(name, lockVertical = false) {
     publishJoystick();
   };
   stick.addEventListener("pointerdown", (event) => {
+    if (state.controlBusy || joystickStopPromise) return;
     if (!byId("confirmMotion").checked) {
       setMessage(byId("controlMessage"), "使用摇杆前必须开启真机动作安全确认。", true);
       return;
     }
+    if (!sticks.left.active && !sticks.right.active) state.joystickTargets = selectedNumbers();
     stick.setPointerCapture(event.pointerId);
     sticks[name].active = true;
     update(event);
@@ -1009,7 +1031,7 @@ byId("joystickMode").addEventListener("change", () => {
   stopJoystick();
   updateJoystickModeNote();
 });
-byId("formationButton").addEventListener("click", async () => { await stopJoystick(); runFormation(); });
+byId("formationButton").addEventListener("click", async () => { if (await stopJoystick()) runFormation(); });
 byId("motionCapture").addEventListener("click", captureMotion);
 byId("motionStart").addEventListener("click", startMotion);
 byId("motionStop").addEventListener("click", async () => {
@@ -1037,7 +1059,13 @@ byId("motionExport").addEventListener("click", () => {
   element.addEventListener("change", drawFormationPreview);
 });
 document.querySelectorAll("[data-command]").forEach((button) => {
-  button.addEventListener("click", () => { stopJoystick(); sendCommand(button.dataset.command); });
+  button.addEventListener("click", async () => {
+    if (button.dataset.command === 'stop') { stopJoystick(); await sendCommand('stop'); return; }
+    if (state.controlBusy) return;
+    state.controlBusy = true;
+    try { if (await stopJoystick()) await sendCommand(button.dataset.command); }
+    finally { state.controlBusy = false; }
+  });
 });
 configureStick("left");
 configureStick("right", true);
@@ -1059,3 +1087,21 @@ setInterval(() => refreshTelemetry().catch(() => {}), 1000);
 setInterval(() => refreshSharedMap().catch(() => {}), 1200);
 setInterval(() => refreshVideos().catch(() => {}), 1000);
 setInterval(() => refreshMotion().catch(() => {}), 500);
+
+async function homeOperation(operation) {
+  if (state.controlBusy) return;
+  state.controlBusy = true;
+  try {
+    if (!(await stopJoystick())) throw new Error('停止未确认');
+    const standing = operation === 'return' ? window.confirm('确认表演已结束、全部站稳，且回位路线和间距安全？') : false;
+    if (operation === 'return' && !standing) return;
+    const result = await api('/api/motion/home', {method:'POST', body:JSON.stringify({
+      operation, targets:selectedNumbers(), confirm_standing:standing,
+      confirm_motion:byId('confirmMotion').checked, confirm_formation:byId('confirmFormation').checked})});
+    if (result.motion) renderMotion(result.motion);
+    setMessage(byId('motionMessage'), operation === 'capture' ? '起点已记录；重连或重新标定后需重新记录。' : '低速回位已启动，请观察机器。');
+  } catch (error) { setMessage(byId('motionMessage'), error.message, true); }
+  finally { state.controlBusy = false; }
+}
+byId('homeCapture').addEventListener('click', () => homeOperation('capture'));
+byId('homeReturn').addEventListener('click', () => homeOperation('return'));
