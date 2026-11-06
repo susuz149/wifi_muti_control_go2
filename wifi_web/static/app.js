@@ -5,6 +5,7 @@ const sticks = {
 };
 let stickTimer = null;
 const aesKeyDrafts = new Map();
+const deviceDrafts = new Map();
 let alignmentPreview = null;
 let alignmentView = null;
 let alignmentDrag = null;
@@ -245,7 +246,17 @@ function selectedNumbers() {
 function renderDevices() {
   updateReferenceCandidates();
   const container = byId("deviceList");
-  if (container.contains(document.activeElement) && document.activeElement.type === "password") return;
+  if (container.contains(document.activeElement) && ['password', 'text'].includes(document.activeElement.type)) return;
+  const groupSelect = byId('deviceGroupSelect');
+  const selectedGroup = groupSelect.value;
+  groupSelect.replaceChildren();
+  for (const group of ['', ...new Set(state.devices.map(d => d.group || '').filter(Boolean))].sort()) {
+    const option = document.createElement('option');
+    option.value = group;
+    option.textContent = group || '全部分组';
+    groupSelect.appendChild(option);
+  }
+  groupSelect.value = [...groupSelect.options].some(o => o.value === selectedGroup) ? selectedGroup : '';
   const connectedList = byId("connectedDeviceList");
   const historyList = byId("historyDeviceList");
   const connectedCount = state.devices.filter((device) => device.connected).length;
@@ -263,8 +274,8 @@ function renderDevices() {
     const row = document.createElement("div");
     row.className = `device ${device.connected ? "connected" : ""}`;
     const health = device.connection_health || {};
-    const unhealthy = ["warning", "failed", "timeout"].includes(health.status);
-    const status = device.busy ? "处理中" : unhealthy ? (health.status === "warning" ? "连接异常" : "已断线") : device.connected ? "已连接" : "未连接";
+    const unhealthy = ["warning", "failed", "timeout", "retrying"].includes(health.status);
+    const status = device.busy ? "处理中" : health.status === 'retrying' ? '等待重连' : unhealthy ? (health.status === "warning" ? "连接异常" : "已断线") : device.connected ? "已连接" : "未连接";
     const identity = device.sn
       ? `SN ${device.sn}`
       : device.verified
@@ -289,7 +300,7 @@ function renderDevices() {
     const information = document.createElement("span");
     const address = document.createElement("span");
     address.className = "address";
-    address.textContent = device.ip;
+    address.textContent = `${device.name ? device.name + ' · ' : ''}${device.ip}${device.group ? ' · ' + device.group : ''}`;
     const detail = document.createElement("div");
     detail.className = "detail";
     detail.textContent = `${identity}${device.error ? ` / ${device.error}` : ""}`;
@@ -342,6 +353,61 @@ function renderDevices() {
     });
     keySettings.append(keyInput, saveKey);
     row.appendChild(keySettings);
+    const metadata = document.createElement('div');
+    metadata.className = 'device-metadata';
+    const draft = deviceDrafts.get(device.number) || {name: device.name || '', group: device.group || ''};
+    const nameInput = document.createElement('input');
+    const groupInput = document.createElement('input');
+    for (const [input, key, label] of [[nameInput, 'name', '设备名称'], [groupInput, 'group', '分组']]) {
+      input.type = 'text';
+      input.maxLength = 40;
+      input.value = draft[key];
+      input.placeholder = label;
+      input.setAttribute('aria-label', `Go2 #${device.number} ${label}`);
+      input.addEventListener('input', () => {
+        draft[key] = input.value;
+        deviceDrafts.set(device.number, draft);
+      });
+    }
+    const saveInfo = document.createElement('button');
+    saveInfo.textContent = '保存名称/分组';
+    saveInfo.addEventListener('click', async () => {
+      saveInfo.disabled = true;
+      try {
+        const result = await api(`/api/devices/${device.number}`, {method:'PATCH',
+          body:JSON.stringify({name:nameInput.value, group:groupInput.value})});
+        deviceDrafts.delete(device.number);
+        state.devices = result.devices;
+        saveInfo.focus();
+        renderDevices();
+        setMessage(byId('scanMessage'), `Go2 #${device.number} 名称和分组已保存。`);
+      } catch (error) { setMessage(byId('scanMessage'), error.message, true); }
+      finally { saveInfo.disabled = false; }
+    });
+    metadata.append(nameInput, groupInput, saveInfo);
+    if (!device.connected) {
+      const remove = document.createElement('button');
+      remove.textContent = '删除历史';
+      remove.disabled = device.busy;
+      remove.addEventListener('click', async () => {
+        if (!window.confirm(`删除 Go2 #${device.number} ${device.name || device.ip} 的历史记录、密钥和标定？`)) return;
+        remove.disabled = true;
+        try {
+          const result = await api(`/api/devices/${device.number}`, {method:'DELETE'});
+          state.devices = result.devices;
+          state.selected.delete(device.number);
+          aesKeyDrafts.delete(device.number);
+          deviceDrafts.delete(device.number);
+          remove.focus();
+          renderDevices();
+          drawFormationPreview();
+          setMessage(byId('scanMessage'), '历史记录已删除；再次扫描仍可发现设备。');
+        } catch (error) { setMessage(byId('scanMessage'), error.message, true); }
+        finally { remove.disabled = false; }
+      });
+      metadata.appendChild(remove);
+    }
+    row.appendChild(metadata);
     (device.connected ? connectedList : historyList).appendChild(row);
   });
   byId("connectedCount").textContent = state.devices.filter((item) => item.connected).length;
@@ -1085,6 +1151,12 @@ byId('startupAutoConnect').addEventListener('change', async () => {
 byId("addButton").addEventListener("click", addManual);
 byId("manualIp").addEventListener("keydown", (event) => { if (event.key === "Enter") addManual(); });
 byId("selectAllButton").addEventListener("click", () => { state.devices.forEach((device) => state.selected.add(device.number)); renderDevices(); drawFormationPreview(); });
+byId('selectGroupButton').addEventListener('click', () => {
+  const group = byId('deviceGroupSelect').value;
+  state.selected = new Set(state.devices.filter(d => !group || d.group === group).map(d => d.number));
+  renderDevices();
+  drawFormationPreview();
+});
 byId("selectConnectedButton").addEventListener("click", () => {
   state.selected = new Set(state.devices.filter((device) => device.connected).map((device) => device.number));
   renderDevices();

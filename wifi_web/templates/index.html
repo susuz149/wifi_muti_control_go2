@@ -23,7 +23,7 @@
           <button id="scanButton" class="primary">扫描当前 Wi-Fi</button>
         </div>
         <label class="inline"><input id="autoConnect" type="checkbox"> 扫描后自动连接发现的候选设备并验证为 Go2</label>
-        <label class="inline"><input id="startupAutoConnect" type="checkbox" checked> 启动程序时自动连接已保存设备</label>
+        <label class="inline"><input id="startupAutoConnect" type="checkbox" checked> 启动自动连接；断线后最多重试 3 次</label>
         <p id="persistenceMessage" class="message">设备和密钥自动保存在本机；点云默认关闭，开启后验证并恢复已保存标定。连接异常、心跳超时在下方每台设备中查看，与点云开关无关。</p>
         <label class="field">扫描网段
           <input id="scanSubnet" value="192.168.12.0/24" placeholder="192.168.12.0/24">
@@ -47,6 +47,11 @@
             <button id="connectButton">连接选中</button>
             <button id="disconnectButton">断开选中</button>
           </div>
+        </div>
+        <div class="device-group-select">
+          <label>按分组选择 <select id="deviceGroupSelect"><option value="">全部分组</option></select></label>
+          <button id="selectGroupButton">选择该组</button>
+          <span class="message">选择会替换当前勾选；未连接设备也会选中，可用于批量连接。</span>
         </div>
         <div id="deviceList" class="device-groups">
           <section class="device-group" aria-labelledby="connectedDevicesTitle">

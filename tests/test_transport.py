@@ -193,7 +193,8 @@ class ConnectionServiceTests(unittest.TestCase):
         self.assertNotIn(self.number, self.service.connections)
         device = self.service.list_devices()[0]
         self.assertFalse(device['connected'])
-        self.assertEqual(device['connection_health']['status'], 'timeout')
+        self.assertEqual(device['connection_health']['status'], 'retrying')
+        self.assertIn(self.number, self.service.reconnect_tasks)
         self.assertIn('心跳', device['error'])
         self.conn.disconnect.assert_awaited_once()
         self.assertTrue(device['auto_connect'])

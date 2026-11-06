@@ -109,6 +109,10 @@ input[type="checkbox"] { accent-color: var(--brand); }
 .device.connected { background: var(--connected); }
 .device-key { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
 .device-key input { flex: 1; min-width: 160px; padding: 9px 12px; }
+.device-metadata { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+.device-metadata input { flex: 1; min-width: 120px; width: 140px; padding: 9px 12px; }
+.device-group-select { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 18px; }
+.device-group-select select { padding: 8px; }
 .number { font-weight: 700; color: var(--brand); }
 .address { font-family: ui-monospace, "SFMono-Regular", monospace; font-size: 14px; }
 .detail { color: var(--muted); font-size: 12px; margin-top: 3px; }

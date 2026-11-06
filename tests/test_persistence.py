@@ -78,7 +78,7 @@ class PersistenceTests(unittest.TestCase):
         noop = lambda *args: None
         conn = SimpleNamespace(connect=AsyncMock(), disconnect=AsyncMock(),
                                video=SimpleNamespace(add_track_callback=noop),
-                               datachannel=SimpleNamespace(set_decoder=noop, disableTrafficSaving=AsyncMock(),
+                               datachannel=SimpleNamespace(channel=SimpleNamespace(readyState='open'), set_decoder=noop, disableTrafficSaving=AsyncMock(),
                                switchVideoChannel=noop, pub_sub=SimpleNamespace(subscribe=noop, unsubscribe=noop)))
         with patch('app.UnitreeWebRTCConnection', return_value=conn), \
              patch.object(service, '_enable_obstacle_avoid', new_callable=AsyncMock, return_value=True), \

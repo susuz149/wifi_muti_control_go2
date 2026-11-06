@@ -19,6 +19,7 @@ class Element {
   addEventListener(name, fn) { (this.events[name] ||= []).push(fn); }
   click() { for(const fn of this.events.click || []) fn({currentTarget:this}); }
   setAttribute() {}
+  focus() {}
   contains() { return false; }
   querySelector() { return new Element(); }
   querySelectorAll() { return []; }
@@ -124,11 +125,36 @@ vm.runInContext(fs.readFileSync('wifi_web/static/app.js','utf8'),context);
   assert.equal(document.getElementById('connectedDeviceList').children[1].children[0].checked,true);
   document.getElementById('selectConnectedButton').click();
   assert.deepEqual(Array.from(vm.runInContext('selectedNumbers()',context)),[1,2]);
+  vm.runInContext(`state.devices[0].name='前排'; state.devices[0].group='A组';
+    state.devices[2].group='B组'; renderDevices()`,context);
+  assert.match(document.getElementById('connectedDeviceList').children[0].children[2].children[0].textContent,/前排.*A组/);
+  document.getElementById('deviceGroupSelect').value='B组';
+  document.getElementById('selectGroupButton').click();
+  assert.deepEqual(Array.from(vm.runInContext('selectedNumbers()',context)),[3]);
+  const fetchBeforeManagement=context.fetch;
+  let metadataRequest;
+  let deleteRequest;
+  context.fetch=async(path,options)=>{
+    if(options.method==='PATCH') metadataRequest=JSON.parse(options.body);
+    if(options.method==='DELETE') deleteRequest=path;
+    return {ok:true,json:async()=>({ok:true,devices:options.method==='DELETE'?[]:[{number:3,ip:'192.0.2.3',name:'后排',group:'B组',connected:false}]})};
+  };
+  const metadata=document.getElementById('historyDeviceList').children[0].children[5];
+  metadata.children[0].value='后排';
+  await metadata.children[2].events.click[0]();
+  assert.deepEqual(metadataRequest,{name:'后排',group:'B组'});
+  assert.equal(document.getElementById('connectedDeviceList').children.length,0);
+  const remove=document.getElementById('historyDeviceList').children[0].children[5].children[3];
+  await remove.events.click[0]();
+  assert.equal(deleteRequest,'/api/devices/3');
+  assert.deepEqual(Array.from(vm.runInContext('selectedNumbers()',context)),[]);
+  context.fetch=fetchBeforeManagement;
   vm.runInContext('state.devices=[]; renderDevices()',context);
   assert.equal(document.getElementById('connectedDeviceList').children.length,0);
   assert.match(document.getElementById('connectedDeviceList').textContent,/暂无/);
   assert.match(document.getElementById('historyDeviceList').textContent,/暂无/);
   console.log('PASS: device groups, counts, selection across reconnect, select connected, empty groups');
+  console.log('PASS: named devices, group selection, metadata save, history deletion and selection cleanup');
   const originalFetch=context.fetch;
   context.fetch=async()=>{throw new Error('offline');};
   await assert.rejects(vm.runInContext('refresh()',context),/offline/);

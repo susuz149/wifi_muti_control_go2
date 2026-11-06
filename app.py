@@ -212,6 +212,8 @@ class Device:
     number: int
     ip: str
     sn: str = ""
+    name: str = ""
+    group: str = ""
     aes_128_key: str = field(default="", repr=False)
     source: str = "manual"
     verified: bool = False
@@ -229,6 +231,8 @@ class Device:
             "number": self.number,
             "ip": self.ip,
             "sn": self.sn,
+            "name": self.name,
+            "group": self.group,
             "has_aes_key": bool(self.aes_128_key or os.environ.get("GO2_AES_" + self.ip.replace(".", "_"), "").strip()),
             "source": self.source,
             "verified": self.verified,
@@ -322,6 +326,7 @@ class MultiGo2Service:
         self.alignment_preview = None
         self.restore_tasks = {}
         self.health_tasks = {}
+        self.reconnect_tasks = {}
         self.cloud_tasks = {}
         self.pending_clouds = {}
         self.cloud_epochs = {}
@@ -353,9 +358,11 @@ class MultiGo2Service:
         state = read_state(self.state_path)
         self.auto_connect_enabled = bool(state.get('auto_connect_enabled', True))
         self.saved_alignments = state.get('alignments', {})
+        self.next_number = max(1, int(state.get('next_number', 1)))
         for item in state.get('devices', []):
             device = Device(number=int(item['number']), ip=str(ipaddress.IPv4Address(item['ip'])),
-                            sn=item.get('sn', ''), aes_128_key=self.validate_aes_key(item.get('aes_128_key', '')),
+                            sn=item.get('sn', ''), name=item.get('name', ''), group=item.get('group', ''),
+                            aes_128_key=self.validate_aes_key(item.get('aes_128_key', '')),
                             auto_connect=bool(item.get('auto_connect', True)))
             self.devices[device.number] = device
             self.frames[device.number] = FrameState(restore_status='等待开启点云后验证旧标定' if device.ip in self.saved_alignments else '未保存标定')
@@ -365,9 +372,9 @@ class MultiGo2Service:
     def _persist_locked(self):
         if self.state_path is None:
             return
-        snapshot = {'version': 1, 'auto_connect_enabled': self.auto_connect_enabled,
+        snapshot = {'version': 1, 'auto_connect_enabled': self.auto_connect_enabled, 'next_number': self.next_number,
                     'devices': [dict(number=d.number, ip=d.ip, sn=d.sn, aes_128_key=d.aes_128_key,
-                                     auto_connect=d.auto_connect) for d in self.devices.values()],
+                                     name=d.name, group=d.group, auto_connect=d.auto_connect) for d in self.devices.values()],
                     'alignments': dict(self.saved_alignments)}
         future = self.state_writer.submit(self._write_state_snapshot, snapshot)
         if threading.current_thread() is getattr(self, 'thread', None):
@@ -529,6 +536,50 @@ class MultiGo2Service:
         with self.lock:
             return [self.devices[number].payload() for number in sorted(self.devices)]
 
+    def update_device(self, number, data):
+        if not isinstance(data, dict):
+            raise ValueError('设备信息必须是对象')
+        updates = {}
+        for key, limit in (('name', 40), ('group', 40)):
+            value = data.get(key, '')
+            if not isinstance(value, str) or len(value.strip()) > limit:
+                raise ValueError('名称和分组必须是最多 40 字的文本')
+            updates[key] = value.strip()
+        with self.lock:
+            device = self.devices.get(number)
+            if device is None:
+                raise ValueError('设备不存在')
+            device.name, device.group = updates['name'], updates['group']
+            self._persist_locked()
+            return device.payload()
+
+    async def delete_device(self, number):
+        device = self.devices.get(number)
+        if device and (device.connected or device.busy or number in self.connections):
+            raise ValueError('请先断开设备，再删除历史记录')
+        async with self.connection_locks.setdefault(number, asyncio.Lock()):
+            with self.lock:
+                device = self.devices.get(number)
+                if device is None:
+                    raise ValueError('设备不存在')
+                if device.connected or device.busy or number in self.connections:
+                    raise ValueError('请先断开设备，再删除历史记录')
+                self._require_alignment_idle([number])
+                if self.alignment_preview and not self.alignment_preview['done'] and number in self.alignment_preview['participants']:
+                    raise ValueError('设备正在标定，请等待任务结束')
+                self.saved_alignments.pop(device.ip, None)
+                self.devices.pop(number)
+                for mapping in (self.frames, self.videos, self.return_points, self.action_until):
+                    mapping.pop(number, None)
+                self.alignment_preview = None
+                saved = self._persist_locked()
+            retry = self.reconnect_tasks.pop(number, None)
+            if retry:
+                retry.cancel()
+                await asyncio.gather(retry, return_exceptions=True)
+            if saved is not None:
+                await asyncio.wrap_future(saved)
+
     def require_devices(self, numbers):
         if not numbers:
             raise ValueError("请至少选择一台 Go2")
@@ -587,6 +638,8 @@ class MultiGo2Service:
             return await self._connect_one_locked(device)
 
     async def _connect_one_locked(self, device):
+        if self.devices.get(device.number) is not device:
+            return {'number': device.number, 'ok': False, 'error': '设备历史记录已删除'}
         if device.number in self.connections:
             old = self.connections[device.number]
             if self._transport_open(old) and device.connected:
@@ -614,6 +667,8 @@ class MultiGo2Service:
                 **connection_kwargs
             )
             await asyncio.wait_for(conn.connect(), timeout=20.0)
+            if not self._transport_open(conn):
+                raise RuntimeError('WebRTC 数据通道未打开')
             conn.datachannel.set_decoder("native")
             self.connections[device.number] = conn
             # A connection starts with control/pose only; cloud streaming is opt-in.
@@ -668,6 +723,11 @@ class MultiGo2Service:
         return results
 
     async def _disconnect_one(self, number, preserve_auto=False):
+        if not preserve_auto:
+            retry = self.reconnect_tasks.pop(number, None)
+            if retry and retry is not asyncio.current_task():
+                retry.cancel()
+                await asyncio.gather(retry, return_exceptions=True)
         async with self.connection_locks.setdefault(number, asyncio.Lock()):
             self.stopping_numbers[number] = self.stopping_numbers.get(number, 0) + 1
             try:
@@ -744,6 +804,8 @@ class MultiGo2Service:
             self.frames[number] = FrameState()
             video = self.videos.setdefault(number, VideoState())
             video.enabled = False
+            video.frame = None
+            video.frame_time = 0.
         return {"number": number, "ok": not bool(cleanup_error), "error": cleanup_error}
 
     @staticmethod
@@ -752,7 +814,7 @@ class MultiGo2Service:
         if pc is not None and pc.connectionState in ('failed', 'closed', 'disconnected'):
             return False
         channel = getattr(conn.datachannel, 'channel', None)
-        return channel is None or channel.readyState == 'open'
+        return channel is not None and channel.readyState == 'open'
 
     def _connection_health(self, conn, started, now):
         pc = getattr(conn, 'pc', None)
@@ -793,10 +855,30 @@ class MultiGo2Service:
                 with self.lock:
                     self.devices[number].connection_health = health
                     self.devices[number].error = health['message']
+                if self.auto_connect_enabled and self.devices[number].auto_connect:
+                    self.reconnect_tasks[number] = asyncio.create_task(self._retry_connection(number))
                 return
             before = time.monotonic()
             await asyncio.sleep(1.)
             self.loop_lag = max(0., time.monotonic()-before-1.)
+
+    async def _retry_connection(self, number):
+        try:
+            for attempt, delay in enumerate((2., 4., 8.), 1):
+                device = self.devices.get(number)
+                if self.closed or not device or not self.auto_connect_enabled or not device.auto_connect:
+                    return
+                device.connection_health = {'status': 'retrying', 'message': f'连接中断，{delay:g} 秒后重试（{attempt}/3）'}
+                await asyncio.sleep(delay)
+                if self.closed or self.devices.get(number) is not device or not self.auto_connect_enabled or not device.auto_connect:
+                    return
+                result = await self._connect_one(device)
+                if result['ok']:
+                    return
+            device.connection_health = {'status': 'failed', 'message': '自动重连 3 次失败，请检查设备或手动连接'}
+        finally:
+            if self.reconnect_tasks.get(number) is asyncio.current_task():
+                self.reconnect_tasks.pop(number, None)
 
     def _subscribe_telemetry(self, number, conn):
         for name, topic in TELEMETRY_TOPICS.items():
@@ -1545,9 +1627,16 @@ class MultiGo2Service:
 
     def video_frame(self, number):
         with self.lock:
-            return self.videos.setdefault(number, VideoState()).frame
+            device = self.devices.get(number)
+            video = self.videos.get(number)
+            return video.frame if device and device.connected and video and video.enabled else None
 
     async def stop_and_disconnect_all(self):
+        retries = list(self.reconnect_tasks.values())
+        for task in retries:
+            task.cancel()
+        if retries:
+            await asyncio.gather(*retries, return_exceptions=True)
         await self.motion.cancel()
         numbers = list(self.connections)
         if numbers:
@@ -2138,6 +2227,22 @@ def set_device_aes_key(number):
     except ValueError as exc:
         return payload_error(str(exc))
     return jsonify({"ok": True, "device": device, "devices": service.list_devices()})
+
+
+@app.route('/api/devices/<int:number>', methods=['PATCH', 'DELETE'])
+def manage_device(number):
+    try:
+        if request.method == 'DELETE':
+            service.submit(service.delete_device(number), timeout=8.)
+            if service.storage_error:
+                return payload_error(service.storage_error)
+            return jsonify(ok=True, devices=service.list_devices())
+        device = service.update_device(number, request.get_json(silent=True))
+        if service.storage_error:
+            return payload_error(service.storage_error)
+        return jsonify(ok=True, device=device, devices=service.list_devices())
+    except (ValueError, TimeoutError) as exc:
+        return payload_error(str(exc))
 
 
 @app.post("/api/connect")
