@@ -1975,7 +1975,8 @@ def joystick_parameters(data):
         "x": x,
         "y": y,
         "z": z,
-        "lx": y / MAX_SPEED,
+        # Wireless left-stick +X is right; Sport positive Y moves left.
+        "lx": -y / MAX_SPEED,
         "ly": x / MAX_SPEED,
         # Wireless right-stick +X is right; Sport positive yaw turns left.
         "rx": -z / MAX_YAW_RATE,
