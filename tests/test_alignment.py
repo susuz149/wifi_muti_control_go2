@@ -88,6 +88,7 @@ class AlignmentServiceTests(unittest.TestCase):
             number = self.service.add_device(ip)['number']
             self.numbers.append(number)
             self.service.devices[number].connected = True
+            self.service.devices[number].cloud_enabled = True
             self.service.connections[number] = object()
             frame = self.service.frames[number]
             frame.local_pose = dict(x=0, y=0, z=0, yaw=0)
@@ -103,7 +104,8 @@ class AlignmentServiceTests(unittest.TestCase):
         self.service.close()
 
     def preview(self):
-        response = self.client.post('/api/frame/auto-align', json={'targets': self.numbers})
+        response = self.client.post('/api/frame/auto-align', json={
+            'targets': self.numbers, 'reference_ip': '192.168.31.191', 'alignment_mode': 'free'})
         self.assertEqual(response.status_code, 200, response.json)
         token = response.json['token']
         deadline = time.time() + 10
@@ -141,7 +143,8 @@ class AlignmentServiceTests(unittest.TestCase):
     def test_stale_reference_and_reconnected_device_rejected(self):
         reference, other, _ = self.numbers
         self.service.frames[reference].last_pose_time = time.time() - 5
-        self.assertEqual(self.client.post('/api/frame/auto-align', json={'targets': self.numbers}).status_code, 400)
+        self.assertEqual(self.client.post('/api/frame/auto-align', json={
+            'targets': self.numbers, 'reference_ip': '192.168.31.191'}).status_code, 400)
         self.refresh_times()
         result = self.preview()
         self.refresh_times()
@@ -153,8 +156,13 @@ class AlignmentServiceTests(unittest.TestCase):
     def test_native_cloud_cached_before_alignment_and_connection_isolation(self):
         first, second, _ = self.numbers
         message = {'topic': app.RTC_TOPIC['ULIDAR_ARRAY'], 'data': {'data': {'points': self.target}}}
+        self.service.frames[first].raw_points = np.empty((0, 3))
         self.service.frames[second].raw_points = np.empty((0, 3))
-        self.service._telemetry_callback(first, app.RTC_TOPIC['ULIDAR_ARRAY'], message)
+        self.service.devices[first].cloud_enabled = True
+        async def receive():
+            self.service._telemetry_callback(first, app.RTC_TOPIC['ULIDAR_ARRAY'], message)
+            await self.service.cloud_tasks[first]
+        self.service.submit(receive())
         self.assertEqual(len(self.service.frames[first].raw_points), len(self.target))
         self.assertEqual(len(self.service.frames[second].raw_points), 0)
         self.assertEqual(self.service.frames[first].map_points, [])

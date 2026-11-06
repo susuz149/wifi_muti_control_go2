@@ -92,6 +92,10 @@ input[type="checkbox"] { accent-color: var(--brand); }
 .manual input { padding: 11px 12px; min-width: 0; flex: 1; }
 .actions { display: flex; flex-wrap: wrap; gap: 7px; justify-content: end; }
 .device-list { display: grid; gap: 8px; }
+.device-groups { display: grid; gap: 24px; }
+.device-group + .device-group { border-top: 1px solid var(--line); padding-top: 16px; }
+.device-group h3 { margin: 0 0 10px; font-size: 16px; }
+.device-group h3 span { display: inline-block; margin-left: 6px; color: var(--muted); font-size: 14px; }
 .device-list.empty { color: var(--muted); padding: 24px 0 12px; }
 .device {
   border: 1px solid var(--line);

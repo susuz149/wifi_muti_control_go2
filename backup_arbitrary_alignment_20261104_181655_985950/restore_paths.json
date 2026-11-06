@@ -1,0 +1,6 @@
+[
+  "app.py",
+  "fleet/registration.py",
+  "wifi_web/static/app.js",
+  "wifi_web/templates/index.html"
+]

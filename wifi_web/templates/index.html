@@ -24,7 +24,7 @@
         </div>
         <label class="inline"><input id="autoConnect" type="checkbox"> 扫描后自动连接发现的候选设备并验证为 Go2</label>
         <label class="inline"><input id="startupAutoConnect" type="checkbox" checked> 启动程序时自动连接已保存设备</label>
-        <p id="persistenceMessage" class="message">设备和密钥自动保存在本机；连接后自动用新点云验证并恢复已保存标定。匹配不足时会提示重新对齐。</p>
+        <p id="persistenceMessage" class="message">设备和密钥自动保存在本机；点云默认关闭，开启后验证并恢复已保存标定。连接异常、心跳超时在下方每台设备中查看，与点云开关无关。</p>
         <label class="field">扫描网段
           <input id="scanSubnet" value="192.168.12.0/24" placeholder="192.168.12.0/24">
         </label>
@@ -42,12 +42,23 @@
           <h2>机器人编号与选择</h2>
           <div class="actions">
             <button id="selectAllButton">全选</button>
+            <button id="selectConnectedButton">只选已连接</button>
             <button id="selectNoneButton">清空</button>
             <button id="connectButton">连接选中</button>
             <button id="disconnectButton">断开选中</button>
           </div>
         </div>
-        <div id="deviceList" class="device-list empty">尚未发现设备</div>
+        <div id="deviceList" class="device-groups">
+          <section class="device-group" aria-labelledby="connectedDevicesTitle">
+            <h3 id="connectedDevicesTitle">已连接 <span id="connectedDeviceCount">0</span></h3>
+            <div id="connectedDeviceList" class="device-list empty">暂无已连接设备</div>
+          </section>
+          <section class="device-group" aria-labelledby="historyDevicesTitle">
+            <h3 id="historyDevicesTitle">历史设备 / 未连接 <span id="historyDeviceCount">0</span></h3>
+            <p class="message">包含已保存、手动添加和扫描发现的未连接设备；勾选后点击“连接选中”。</p>
+            <div id="historyDeviceList" class="device-list empty">暂无历史或待连接设备</div>
+          </section>
+        </div>
       </section>
 
       <section class="panel control">
@@ -117,21 +128,27 @@
           </div>
           <button id="refreshTelemetryButton">刷新状态</button>
         </div>
+        <div class="actions">
+          <button id="pointCloudOnButton">开启选中点云</button>
+          <button id="pointCloudOffButton">关闭选中点云</button>
+        </div>
+        <p id="pointCloudMessage" class="message">点云默认关闭。查看地图、恢复标定或自动对齐前，请开启所需设备（包括参考狗）的点云；完成后可关闭。连接健康在设备列表查看。</p>
         <div class="frame-settings">
-          <label>参考狗 IP <input id="referenceIp" value="192.168.31.191" aria-label="参考狗 IP"></label>
+          <label>参考狗 IP <input id="referenceIp" list="referenceCandidates" placeholder="选择已连接机器的 IP" aria-label="参考狗 IP"><datalist id="referenceCandidates"></datalist></label>
+          <label>标定模式 <select id="alignmentMode"><option value="free" selected>任意摆放自动识别（不要求同排、同向）</option><option value="row">已知横排布局（辅助约束）</option></select></label>
           <button id="autoAlignButton" class="primary">自动对齐选中设备</button>
           <button id="applyAutoAlignButton" disabled>应用预览</button>
           <button id="cancelAutoAlignButton">退出预览</button>
         </div>
-        <label class="inline"><input id="layoutEnabled" type="checkbox" checked> 使用已知摆放布局：同向横排，左右以参考狗头朝向为准</label>
-        <div class="frame-settings">
-          <label>左侧由近到远（IP 或末段）<input id="layoutLeftIps" value="214, 120, 103"></label>
-          <label>右侧由近到远（IP 或末段）<input id="layoutRightIps" value="142, 113, 232"></label>
+        <div id="rowLayoutFields" class="frame-settings" hidden>
+          <label>左侧由近到远（IP 或末段）<input id="layoutLeftIps" placeholder="例如 214, 120"></label>
+          <label>右侧由近到远（IP 或末段）<input id="layoutRightIps" placeholder="例如 142, 113"></label>
           <label>相邻机身中心最小间距 m <input id="layoutMinSpacing" type="number" min="0.3" max="2" step="0.05" value="0.5"></label>
           <label>相邻机身中心最大间距 m <input id="layoutMaxSpacing" type="number" min="0.3" max="2" step="0.05" value="0.8"></label>
         </div>
-        <p class="message">布局只限定点云匹配的搜索范围，实际位置仍需点云验证。前后偏差允许 ±0.4m，同向偏差允许 ±20°；摆放改变后请更新列表，或关闭布局约束。</p>
-        <p class="message">对齐需要新鲜定位和重叠点云。定位过期的设备会跳过；匹配不足时可微调预览。应用会替换全部旧标定，未通过的设备需重新对齐。</p>
+        <p id="alignmentModeNote" class="message">任意摆放：仅选择参与机器和参考狗，无需填写左右顺序、间距或朝向。参考狗自动加入；每台分别与参考狗的共同环境匹配。整个过程不驱动机器人。</p>
+        <p class="message">参考坐标固定在采集时参考狗的位置（0,0）和朝向（+X），不会跟着它移动。只有地面、单墙或对称环境时可能无法确定位置，失败与歧义均不会自动通过。</p>
+        <p class="message">对齐需要新鲜定位和重叠点云，采集到应用期间请保持全部机器静止。先核对预览中的 X、Y、朝向和墙面重合，再应用；匹配失败显示红色候选，不代表已定位。应用会替换全部旧标定、清除旧回位起点，未通过设备保持未标定。</p>
         <div id="alignmentResults" class="alignment-results"></div>
         <div id="alignmentEditor" class="frame-settings" hidden>
           <label>微调设备 <select id="adjustRobot"></select></label>
@@ -248,8 +265,8 @@
           </label>
         </div>
         <div id="profileNote" class="profile-note"></div>
-        <label>动作保护等待（秒，0 表示不额外等待）<input id="actionHoldSeconds" type="number" min="0" max="120" value="0" step="0.5"></label>
-        <p class="message">默认在指令请求返回后即可继续下发；同一台机器有运动指令在途时拒绝重复发送。设置保护时间后，从下发时开始计时，期间拒绝新的运动指令；停止可随时中断。请求返回和保护期结束均不代表动作完成，回位前请确认动作结束并站稳。</p>
+        <label>动作后等待（秒，默认不等待；估计值，不代表动作完成）<input id="actionHoldSeconds" type="number" min="0" max="120" value="0" step="0.5"></label>
+        <p class="message">设为 0 时不增加动作后的等待；如手动设置等待时长，等待期内拒绝新的运动指令，停止可中断等待。动作未结束时不要启动回位。</p>
         <div id="sportCatalog" class="catalog"></div>
       </section>
     </main>

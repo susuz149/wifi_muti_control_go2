@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -74,14 +75,13 @@ class CommandOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.service.connected_connections = lambda numbers: [(n, None) for n in numbers]
         self.service._sport_request = AsyncMock(return_value=None)
 
-    async def test_default_allows_consecutive_actions_without_waiting(self):
+    async def test_default_has_no_wait_after_request_completes(self):
         parameters = app.sport_action_parameters({'action': 'StandUp'})
         self.assertEqual(parameters['hold_seconds'], 0.)
-        for _ in range(2):
-            result = await self.service.command([1], 'sport_action', parameters)
-            self.assertTrue(result[0]['ok'])
+        self.assertTrue((await self.service.command([1], 'sport_action', parameters))[0]['ok'])
+        self.assertNotIn(1, self.service.action_until)
+        self.assertTrue((await self.service.command([1], 'sport_action', parameters))[0]['ok'])
         self.assertEqual(self.service._sport_request.await_count, 2)
-        self.assertEqual(self.service.action_until, {})
         self.assertEqual(self.service.pending_motion_commands, {})
 
     async def test_explicit_hold_blocks_motion_but_not_queries_or_stop(self):
@@ -117,10 +117,12 @@ class CommandOwnershipTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await first
+        self.service.action_until[1] = time.monotonic()-1
         self.assertTrue((await self.service.command([1], 'sport_action', parameters))[0]['ok'])
 
-    def test_hold_seconds_accepts_zero_and_rejects_out_of_range(self):
-        self.assertEqual(app.sport_action_parameters({'action': 'StandUp', 'hold_seconds': 0})['hold_seconds'], 0.)
+    def test_optional_wait_allows_zero_and_validates_range(self):
+        for value in (0, .49, .5, 120):
+            self.assertEqual(app.sport_action_parameters({'action': 'StandUp', 'hold_seconds': value})['hold_seconds'], value)
         for value in (-1, 121):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 app.sport_action_parameters({'action': 'StandUp', 'hold_seconds': value})

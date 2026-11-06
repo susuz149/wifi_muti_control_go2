@@ -34,7 +34,7 @@ function renderAlignmentResults() {
     line.className = `alignment-result ${r.accepted || r.manualConfirmed ? "accepted" : ""}`;
     const pose = r.transform ? previewPose(r.local_pose, r.transform) : null;
     const slot = r.bounds ? (r.bounds.rank === 0 ? "中心参考" : `${r.bounds.rank > 0 ? "左" : "右"}${Math.abs(r.bounds.rank)}`) : "";
-    line.textContent = `#${r.number} ${r.ip}${slot ? ` [${slot}]` : ""} · ${r.manualConfirmed ? "已人工确认" : r.reason}${r.overlap !== undefined ? ` · 重叠 ${(r.overlap*100).toFixed(0)}% / 匹配误差 ${r.rmse}m` : ""}${pose ? ` · 位置(${pose.x.toFixed(2)}, ${pose.y.toFixed(2)})m / 朝向 ${(pose.yaw*180/Math.PI).toFixed(1)}°` : ""}`;
+    line.textContent = `[${r.accepted ? "通过" : r.manualConfirmed ? "人工确认" : "未通过"}] #${r.number} ${r.ip}${slot ? ` [${slot}]` : ""} · ${r.manualConfirmed ? "已人工确认" : r.reason}${r.overlap !== undefined ? ` · 重叠 ${(r.overlap*100).toFixed(0)}% / 匹配误差 ${r.rmse}m` : ""}${pose ? ` · 位置(${pose.x.toFixed(2)}, ${pose.y.toFixed(2)})m / 朝向 ${(pose.yaw*180/Math.PI).toFixed(1)}°` : ""}`;
     container.appendChild(line);
     if (r.transform && r.number !== alignmentPreview.reference) {
       const option = document.createElement("option");
@@ -45,7 +45,40 @@ function renderAlignmentResults() {
   });
   if ([...byId("adjustRobot").options].some((o) => o.value === previous)) byId("adjustRobot").value = previous;
   byId("alignmentEditor").hidden = !alignmentPreview?.done || !byId("adjustRobot").options.length;
-  byId("applyAutoAlignButton").disabled = !alignmentPreview?.done || !!alignmentPreview?.error;
+  byId("applyAutoAlignButton").disabled = !alignmentPreview?.done || !!alignmentPreview?.error ||
+    !(alignmentPreview?.results || []).some((r) => r.number !== alignmentPreview.reference && (r.accepted || r.manualConfirmed));
+}
+
+function alignmentOptions() {
+  const mode = byId("alignmentMode").value;
+  if (!["free", "row"].includes(mode)) throw new Error("未知标定模式");
+  const options = {alignment_mode:mode, layout_enabled:mode === "row"};
+  if (mode === "row") Object.assign(options, {
+    left_ips:byId("layoutLeftIps").value, right_ips:byId("layoutRightIps").value,
+    min_spacing:byId("layoutMinSpacing").value, max_spacing:byId("layoutMaxSpacing").value,
+  });
+  return options;
+}
+
+function updateAlignmentMode() {
+  const row = byId("alignmentMode").value === "row";
+  byId("rowLayoutFields").hidden = !row;
+  byId("rowLayoutFields").querySelectorAll("input").forEach((input) => { input.disabled = !row; });
+  byId("alignmentModeNote").textContent = row
+    ? "横排辅助：按参考狗头朝向填写左右顺序。约束前后 ±0.4m、同向 ±20°，实际位置仍须点云验证。任意阵型请选择任意摆放模式。"
+    : "任意摆放：仅选择参与机器和参考狗，无需填写左右顺序、间距或朝向。参考狗自动加入；各台分别匹配共同环境；不会驱动机器人。";
+}
+
+function updateReferenceCandidates() {
+  const list = byId("referenceCandidates");
+  list.replaceChildren();
+  const connected = state.devices.filter((d) => d.connected);
+  connected.forEach((d) => {
+    const option = document.createElement("option"); option.value = d.ip; option.label = `#${d.number}`; list.appendChild(option);
+  });
+  if (!byId("referenceIp").value && connected.length) {
+    byId("referenceIp").value = (connected.find((d) => state.selected.has(d.number)) || connected[0]).ip;
+  }
 }
 
 async function autoAlign() {
@@ -56,11 +89,10 @@ async function autoAlign() {
   renderAlignmentResults();
   setMessage(byId("frameMessage"), "正在匹配点云，请保持机器人静止；预览不会改变现有坐标。");
   try {
+    if (!(await stopJoystick())) throw new Error("摇杆停止未确认，请检查后再标定");
     const start = await api("/api/frame/auto-align", {method:"POST", body:JSON.stringify({
       targets:selectedNumbers(), reference_ip:byId("referenceIp").value,
-      layout_enabled:byId("layoutEnabled").checked,
-      left_ips:byId("layoutLeftIps").value, right_ips:byId("layoutRightIps").value,
-      min_spacing:byId("layoutMinSpacing").value, max_spacing:byId("layoutMaxSpacing").value,
+      ...alignmentOptions(),
     })});
     while (requestId === alignmentRequest) {
       const result = await api(`/api/frame/auto-align/${start.token}`);
@@ -70,7 +102,9 @@ async function autoAlign() {
       drawSharedMap();
       if (result.done) {
         if (result.error) throw new Error(result.error);
-        setMessage(byId("frameMessage"), "预览完成。检查墙面、柱子是否重合；可拖动和旋转微调，确认后应用。匹配失败的设备不会自动应用。");
+        const others = result.results.filter((r) => r.number !== result.reference);
+        const passed = others.filter((r) => r.accepted).length;
+        setMessage(byId("frameMessage"), `${result.mode === "free" ? "任意摆放" : "横排辅助"}预览完成：${passed}/${others.length} 台非参考机器通过。请核对 X、Y、朝向及墙面重合；失败候选不会自动应用。`, passed === 0);
         break;
       }
       await new Promise((resolve) => setTimeout(resolve, 800));
@@ -176,13 +210,27 @@ async function startMotion() {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
-  const result = await response.json();
-  if (!response.ok || !result.ok) throw new Error(result.error || "请求失败");
-  return result;
+  const controller = new AbortController();
+  const readOnly = !options.method || options.method === 'GET';
+  const timer = setTimeout(() => controller.abort(), readOnly ? 5000 : 75000);
+  try {
+    const response = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      ...options,
+      signal: controller.signal,
+    });
+    let result;
+    try { result = await response.json(); }
+    catch (_error) { throw new Error(`服务器响应异常（HTTP ${response.status}），请检查服务是否正常运行。`); }
+    if (!response.ok || !result.ok) throw new Error(result.error || `请求失败（HTTP ${response.status}）`);
+    return result;
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(readOnly
+      ? '状态读取超时，请检查页面到服务的网络连接。'
+      : '请求超时，操作结果尚未确认，请刷新设备状态后再操作。');
+    if (error instanceof TypeError) throw new Error('无法连接后台服务，请检查网络和服务是否已启动。');
+    throw error;
+  } finally { clearTimeout(timer); }
 }
 
 function setMessage(element, text, failed = false) {
@@ -195,20 +243,28 @@ function selectedNumbers() {
 }
 
 function renderDevices() {
+  updateReferenceCandidates();
   const container = byId("deviceList");
   if (container.contains(document.activeElement) && document.activeElement.type === "password") return;
-  if (!state.devices.length) {
-    container.className = "device-list empty";
-    container.textContent = "尚未发现设备";
-    byId("connectedCount").textContent = "0";
-    return;
+  const connectedList = byId("connectedDeviceList");
+  const historyList = byId("historyDeviceList");
+  const connectedCount = state.devices.filter((device) => device.connected).length;
+  byId("connectedDeviceCount").textContent = String(connectedCount);
+  byId("historyDeviceCount").textContent = String(state.devices.length - connectedCount);
+  for (const [list, count, emptyText] of [
+    [connectedList, connectedCount, '暂无已连接设备'],
+    [historyList, state.devices.length - connectedCount, '暂无历史或待连接设备'],
+  ]) {
+    list.replaceChildren();
+    list.className = count ? 'device-list' : 'device-list empty';
+    if (!count) list.textContent = emptyText;
   }
-  container.className = "device-list";
-  container.innerHTML = "";
   state.devices.forEach((device) => {
     const row = document.createElement("div");
     row.className = `device ${device.connected ? "connected" : ""}`;
-    const status = device.busy ? "处理中" : device.connected ? "已连接" : "未连接";
+    const health = device.connection_health || {};
+    const unhealthy = ["warning", "failed", "timeout"].includes(health.status);
+    const status = device.busy ? "处理中" : unhealthy ? (health.status === "warning" ? "连接异常" : "已断线") : device.connected ? "已连接" : "未连接";
     const identity = device.sn
       ? `SN ${device.sn}`
       : device.verified
@@ -223,6 +279,10 @@ function renderDevices() {
     checkbox.dataset.number = String(device.number);
     checkbox.setAttribute("aria-label", `选择 Go2 #${device.number}`);
     checkbox.checked = state.selected.has(device.number);
+    checkbox.addEventListener("change", () => {
+      checkbox.checked ? state.selected.add(device.number) : state.selected.delete(device.number);
+      drawFormationPreview();
+    });
     const number = document.createElement("span");
     number.className = "number";
     number.textContent = `#${device.number}`;
@@ -234,9 +294,20 @@ function renderDevices() {
     detail.className = "detail";
     detail.textContent = `${identity}${device.error ? ` / ${device.error}` : ""}`;
     information.append(address, detail);
+    const connectionDetail = document.createElement("div");
+    connectionDetail.className = "detail";
+    const seconds = (value) => value == null ? "等待响应" : `${value}s 前`;
+    connectionDetail.textContent = `${health.message || status} · 心跳 ${seconds(health.heartbeat_age)} · 收包 ${seconds(health.receive_age)} · 点云${device.cloud_enabled ? "开启" : "关闭"}`;
+    if (device.connected || unhealthy) {
+      connectionDetail.textContent += ` · WebRTC=${health.peer_state || "?"} / ICE=${health.ice_state || "?"} / 通道=${health.channel_state || "?"} · 后端调度延迟=${health.loop_lag_ms ?? "?"}ms`;
+    }
+    if (health.decode_error) connectionDetail.textContent += ` · 点云解码异常：${health.decode_error}`;
+    if (unhealthy) connectionDetail.style.color = "#b63326";
+    information.appendChild(connectionDetail);
     const statusPill = document.createElement("span");
     statusPill.className = "status";
     statusPill.textContent = status;
+    if (unhealthy) statusPill.style.color = "#b63326";
     row.append(checkbox, number, information, statusPill);
     const keySettings = document.createElement("div");
     keySettings.className = "device-key";
@@ -271,20 +342,22 @@ function renderDevices() {
     });
     keySettings.append(keyInput, saveKey);
     row.appendChild(keySettings);
-    container.appendChild(row);
+    (device.connected ? connectedList : historyList).appendChild(row);
   });
-	  container.querySelectorAll("input[type=checkbox]").forEach((checkbox) => {
-	    checkbox.addEventListener("change", () => {
-	      const number = Number(checkbox.dataset.number);
-	      checkbox.checked ? state.selected.add(number) : state.selected.delete(number);
-	      drawFormationPreview();
-	    });
-	  });
   byId("connectedCount").textContent = state.devices.filter((item) => item.connected).length;
 }
 
 async function refresh() {
-  const result = await api("/api/devices");
+  let result;
+  try { result = await api("/api/devices"); }
+  catch (error) {
+    state.backendUnavailable = true;
+    byId("connectedCount").textContent = "未知";
+    setMessage(byId("scanMessage"), `${error.message} 当前设备状态可能已过期。`, true);
+    throw error;
+  }
+  if (state.backendUnavailable) setMessage(byId("scanMessage"), '后台连接已恢复，设备状态已更新。');
+  state.backendUnavailable = false;
   state.devices = result.devices;
   renderDevices();
   if (result.storage_error) setMessage(byId("persistenceMessage"), result.storage_error, true);
@@ -324,11 +397,15 @@ function renderTelemetry() {
     const voxel = lidar.voxel || {};
     const stateData = lidar.state || {};
     const lidarLine = document.createElement("p");
-    lidarLine.textContent = `LiDAR(${lidar.voxel_topic || "rt/utlidar/voxel_map_compressed"}): points=${voxel.point_count || 0}, faces=${voxel.face_count || 0}, cloud_hz=${stateData.cloud_frequency ?? "?"}, dirty=${stateData.dirty_percentage ?? "?"}`;
+    lidarLine.textContent = robot.cloud_enabled
+      ? `点云已开启 · LiDAR: points=${voxel.point_count || 0}, cloud_hz=${stateData.cloud_frequency ?? "?"}, dirty=${stateData.dirty_percentage ?? "?"}`
+      : "点云未开启 · 不接收或处理点云；连接健康请查看设备列表";
     const age = document.createElement("p");
     const fresh = robot.connected && robot.last_pose_age !== null && robot.last_pose_age <= 1;
-    age.textContent = `${fresh ? "定位正常" : "定位过期或未连接"} · pose age=${robot.last_pose_age ?? "?"}s · 点云 age=${robot.cloud_age ?? "?"}s · seq=${robot.sequence}${robot.error ? `, error=${robot.error}` : ""}`;
-    if (!fresh) age.style.color = "#b63326";
+    const cloudFresh = robot.cloud_age != null && robot.cloud_age <= 3;
+    const cloudStatus = !robot.cloud_enabled ? "点云未开启" : robot.cloud_age == null ? "等待点云" : `${cloudFresh ? "点云正常" : "点云超时"}（${robot.cloud_age}s 前）`;
+    age.textContent = `${fresh ? "定位正常" : "定位过期或未连接"} · pose age=${robot.last_pose_age ?? "?"}s · ${cloudStatus} · seq=${robot.sequence}${robot.error ? `, error=${robot.error}` : ""}`;
+    if (!fresh || (robot.cloud_enabled && !cloudFresh)) age.style.color = "#b63326";
     card.append(title, local, map, lidarLine, age);
     container.appendChild(card);
   });
@@ -434,6 +511,26 @@ async function refreshTelemetry(quiet = true) {
   }
 }
 
+async function setPointCloud(enabled) {
+  const buttons = [byId("pointCloudOnButton"), byId("pointCloudOffButton")];
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    const targets = selectedNumbers();
+    if (!targets.length) throw new Error("请先选择设备；对齐时也需选择参考狗开启点云");
+    const result = await api("/api/point-cloud", {method:"POST", body:JSON.stringify({targets, enabled})});
+    state.devices = result.devices;
+    state.telemetry = result.robots;
+    const failures = result.results.filter((item) => !item.ok);
+    renderDevices();
+    renderTelemetry();
+    await refreshSharedMap();
+    setMessage(byId("pointCloudMessage"), failures.length
+      ? failures.map((item) => `#${item.number}: ${item.error}`).join("; ")
+      : enabled ? "已开启选中点云，等待新鲜数据；如有已保存标定，将尝试恢复。" : "已关闭选中点云；心跳和连接异常仍在设备列表显示。", failures.length > 0);
+  } catch (error) { setMessage(byId("pointCloudMessage"), error.message, true); }
+  finally { buttons.forEach((button) => { button.disabled = false; }); }
+}
+
 async function alignFrame() {
   try {
     const result = await api("/api/frame/align", {
@@ -506,7 +603,12 @@ async function addManual() {
   }
 }
 
+let connectionBusy = false;
 async function connectionAction(path) {
+  if (connectionBusy) return;
+  connectionBusy = true;
+  byId("connectButton").disabled = byId("disconnectButton").disabled = true;
+  setMessage(byId("scanMessage"), path === '/api/connect' ? '正在连接，请稍候…' : '正在停止并断开，请稍候…');
   try {
     const result = await api(path, {
       method: "POST",
@@ -518,6 +620,9 @@ async function connectionAction(path) {
     setMessage(byId("scanMessage"), failures.length ? failures.map((item) => item.error).join("; ") : "连接状态已更新。", failures.length > 0);
   } catch (error) {
     setMessage(byId("scanMessage"), error.message, true);
+  } finally {
+    connectionBusy = false;
+    byId("connectButton").disabled = byId("disconnectButton").disabled = false;
   }
 }
 
@@ -974,18 +1079,27 @@ byId("scanButton").addEventListener("click", scan);
 byId('startupAutoConnect').addEventListener('change', async () => {
   try {
     await api('/api/settings', {method:'POST', body:JSON.stringify({auto_connect_enabled:byId('startupAutoConnect').checked})});
-    setMessage(byId('persistenceMessage'), '启动连接偏好已保存。设备和密钥自动保存；旧标定在连接后经点云验证恢复。');
+    setMessage(byId('persistenceMessage'), '启动连接偏好已保存。设备和密钥自动保存；旧标定在开启点云后验证恢复。连接异常请查看设备列表。');
   } catch (error) { setMessage(byId('persistenceMessage'), error.message, true); }
 });
 byId("addButton").addEventListener("click", addManual);
 byId("manualIp").addEventListener("keydown", (event) => { if (event.key === "Enter") addManual(); });
 byId("selectAllButton").addEventListener("click", () => { state.devices.forEach((device) => state.selected.add(device.number)); renderDevices(); drawFormationPreview(); });
+byId("selectConnectedButton").addEventListener("click", () => {
+  state.selected = new Set(state.devices.filter((device) => device.connected).map((device) => device.number));
+  renderDevices();
+  drawFormationPreview();
+});
 byId("selectNoneButton").addEventListener("click", () => { state.selected.clear(); renderDevices(); drawFormationPreview(); });
 byId("connectButton").addEventListener("click", () => connectionAction("/api/connect"));
 byId("disconnectButton").addEventListener("click", () => connectionAction("/api/disconnect"));
 byId("refreshTelemetryButton").addEventListener("click", () => refreshTelemetry(false));
+byId("pointCloudOnButton").addEventListener("click", () => setPointCloud(true));
+byId("pointCloudOffButton").addEventListener("click", () => setPointCloud(false));
 byId("alignButton").addEventListener("click", alignFrame);
 byId("clearAlignButton").addEventListener("click", clearAlignment);
+byId("alignmentMode").addEventListener("change", updateAlignmentMode);
+updateAlignmentMode();
 byId("autoAlignButton").addEventListener("click", autoAlign);
 byId("applyAutoAlignButton").addEventListener("click", applyAutoAlign);
 byId("cancelAutoAlignButton").addEventListener("click", () => {
@@ -1082,11 +1196,20 @@ refreshMotion().catch(() => {});
 loadCatalog().catch((error) => setMessage(byId("controlMessage"), error.message, true));
 drawFormationPreview();
 drawSharedMap();
-setInterval(() => refresh().catch(() => {}), 2000);
-setInterval(() => refreshTelemetry().catch(() => {}), 1000);
-setInterval(() => refreshSharedMap().catch(() => {}), 1200);
-setInterval(() => refreshVideos().catch(() => {}), 1000);
-setInterval(() => refreshMotion().catch(() => {}), 500);
+function pollWithoutOverlap(task, interval) {
+  let busy = false;
+  setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try { await task(); } catch (_error) { /* The next poll can recover. */ }
+    finally { busy = false; }
+  }, interval);
+}
+pollWithoutOverlap(refresh, 1000);
+pollWithoutOverlap(refreshTelemetry, 1000);
+pollWithoutOverlap(refreshSharedMap, 1200);
+pollWithoutOverlap(refreshVideos, 1000);
+pollWithoutOverlap(refreshMotion, 500);
 
 async function homeOperation(operation) {
   if (state.controlBusy) return;

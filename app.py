@@ -7,6 +7,7 @@ import asyncio
 import atexit
 import ipaddress
 import json
+import logging
 import math
 import random
 import re
@@ -17,6 +18,7 @@ import types
 import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 import cv2
 import numpy as np
@@ -34,6 +36,9 @@ sys.modules.setdefault("sounddevice", types.ModuleType("sounddevice"))
 import unitree_webrtc_connect.webrtc_driver as webrtc_driver
 from unitree_webrtc_connect.constants import DATA_CHANNEL_TYPE, OBSTACLES_AVOID_API, RTC_TOPIC, SPORT_CMD, SPORT_CMD_MCF
 from unitree_webrtc_connect.multicast_scanner import discover_ip_sn
+from fleet.transport import ResponsiveConnection, install_driver_fixes
+
+install_driver_fixes()
 
 
 MAX_SPEED = 0.5
@@ -198,7 +203,7 @@ class DisabledAudioChannel:
 
 
 webrtc_driver.WebRTCAudioChannel = DisabledAudioChannel
-UnitreeWebRTCConnection = webrtc_driver.UnitreeWebRTCConnection
+UnitreeWebRTCConnection = ResponsiveConnection
 WebRTCConnectionMethod = webrtc_driver.WebRTCConnectionMethod
 
 
@@ -216,6 +221,8 @@ class Device:
     error: str = ""
     last_seen: float = field(default_factory=time.time)
     auto_connect: bool = True
+    cloud_enabled: bool = False
+    connection_health: dict = field(default_factory=lambda: {"status": "disconnected", "message": "未连接"})
 
     def payload(self):
         return {
@@ -231,6 +238,8 @@ class Device:
             "error": self.error,
             "last_seen": self.last_seen,
             "auto_connect": self.auto_connect,
+            "cloud_enabled": self.cloud_enabled,
+            "connection_health": dict(self.connection_health),
         }
 
 
@@ -260,6 +269,7 @@ class FrameState:
             "ip": device.ip,
             "sn": device.sn,
             "connected": device.connected,
+            "cloud_enabled": device.cloud_enabled,
             "restore_status": self.restore_status,
             "aligned": self.aligned,
             "local_pose": self.local_pose,
@@ -305,11 +315,19 @@ class MultiGo2Service:
         self.saved_alignments = {}
         self.auto_connect_enabled = True
         self.storage_error = ''
+        self.state_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix='go2-state')
         self.devices = {}
         self.next_number = 1
         self.connections = {}
         self.alignment_preview = None
         self.restore_tasks = {}
+        self.health_tasks = {}
+        self.cloud_tasks = {}
+        self.pending_clouds = {}
+        self.cloud_epochs = {}
+        self.connection_locks = {}
+        self.video_tasks = {}
+        self.loop_lag = 0.
         self.joystick_deadmen = {}
         self.pending_motion_commands = {}
         self.control_tasks = {}
@@ -340,18 +358,25 @@ class MultiGo2Service:
                             sn=item.get('sn', ''), aes_128_key=self.validate_aes_key(item.get('aes_128_key', '')),
                             auto_connect=bool(item.get('auto_connect', True)))
             self.devices[device.number] = device
-            self.frames[device.number] = FrameState(restore_status='等待连接后验证旧标定' if device.ip in self.saved_alignments else '未保存标定')
+            self.frames[device.number] = FrameState(restore_status='等待开启点云后验证旧标定' if device.ip in self.saved_alignments else '未保存标定')
             self.videos[device.number] = VideoState()
             self.next_number = max(self.next_number, device.number + 1)
 
     def _persist_locked(self):
         if self.state_path is None:
             return
+        snapshot = {'version': 1, 'auto_connect_enabled': self.auto_connect_enabled,
+                    'devices': [dict(number=d.number, ip=d.ip, sn=d.sn, aes_128_key=d.aes_128_key,
+                                     auto_connect=d.auto_connect) for d in self.devices.values()],
+                    'alignments': dict(self.saved_alignments)}
+        future = self.state_writer.submit(self._write_state_snapshot, snapshot)
+        if threading.current_thread() is getattr(self, 'thread', None):
+            return future
+        future.result()
+
+    def _write_state_snapshot(self, snapshot):
         try:
-            write_state(self.state_path, {'version': 1, 'auto_connect_enabled': self.auto_connect_enabled,
-                        'devices': [dict(number=d.number, ip=d.ip, sn=d.sn, aes_128_key=d.aes_128_key,
-                                         auto_connect=d.auto_connect) for d in self.devices.values()],
-                        'alignments': self.saved_alignments})
+            write_state(self.state_path, snapshot)
             self.storage_error = ''
         except (OSError, ValueError) as exc:
             self.storage_error = f'本地配置保存失败：{exc}'
@@ -421,10 +446,17 @@ class MultiGo2Service:
     def _run_loop(self):
         self.loop = asyncio.new_event_loop()
         self.restore_semaphore = asyncio.Semaphore(2)
+        self.video_semaphore = asyncio.Semaphore(2)
         asyncio.set_event_loop(self.loop)
         self.loop.call_soon(self._keep_loop_responsive)
         self.ready.set()
         self.loop.run_forever()
+        pending = asyncio.all_tasks(self.loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        self.loop.run_until_complete(self.loop.shutdown_asyncgens())
         self.loop.close()
 
     def _keep_loop_responsive(self):
@@ -437,7 +469,12 @@ class MultiGo2Service:
         if self.closed or self.loop is None:
             coroutine.close()
             raise RuntimeError("WebRTC 后端已经关闭")
-        return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout=timeout)
+        future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError('后端操作超时，已取消等待中的任务') from exc
 
     def add_device(self, ip, sn="", source="manual", aes_128_key=None):
         if aes_128_key is not None:
@@ -546,11 +583,21 @@ class MultiGo2Service:
         return await asyncio.gather(*(self._connect_one(device) for device in devices))
 
     async def _connect_one(self, device):
+        async with self.connection_locks.setdefault(device.number, asyncio.Lock()):
+            return await self._connect_one_locked(device)
+
+    async def _connect_one_locked(self, device):
         if device.number in self.connections:
-            return {"number": device.number, "ok": True}
+            old = self.connections[device.number]
+            if self._transport_open(old) and device.connected:
+                return {"number": device.number, "ok": True}
+            if device.busy:
+                return {"number": device.number, "ok": False, "error": "该设备正在连接，请稍候"}
+            await self._disconnect_one_locked(device.number, preserve_auto=True)
         if device.busy:
             return {"number": device.number, "ok": False, "error": "该设备正在连接，请稍候"}
         self.set_status(device.number, busy=True, error="")
+        device.connection_health = {"status": "connecting", "message": "正在建立连接"}
         aes_env_name = "GO2_AES_" + str(device.ip).replace(".", "_")
         aes_key = device.aes_128_key or os.environ.get(aes_env_name, "").strip()
 
@@ -560,6 +607,7 @@ class MultiGo2Service:
             connection_kwargs["aes_128_key"] = aes_key
 
         conn = None
+        phase = '建立 WebRTC 和验证数据通道'
         try:
             conn = UnitreeWebRTCConnection(
                 WebRTCConnectionMethod.LocalSTA,
@@ -568,13 +616,18 @@ class MultiGo2Service:
             await asyncio.wait_for(conn.connect(), timeout=20.0)
             conn.datachannel.set_decoder("native")
             self.connections[device.number] = conn
-            await conn.datachannel.disableTrafficSaving(True)
-            self.frames[device.number] = FrameState()
+            # A connection starts with control/pose only; cloud streaming is opt-in.
+            phase = '设置点云流量节省'
+            await asyncio.wait_for(conn.datachannel.disableTrafficSaving(False), timeout=3.)
+            conn.datachannel.switchVideoChannel(False)
+            device.cloud_enabled = False
+            self.frames[device.number] = FrameState(restore_status='等待开启点云后验证旧标定' if device.ip in self.saved_alignments else '未保存标定')
             self.videos.setdefault(device.number, VideoState())
             conn.video.add_track_callback(
-                lambda track, number=device.number: self._video_track_reader(number, track)
+                lambda track, number=device.number: self._video_track_reader(number, track, conn)
             )
             self._subscribe_telemetry(device.number, conn)
+            phase = '开启并确认避障'
             avoid_enabled = await self._enable_obstacle_avoid(conn)
             self.set_status(
                 device.number,
@@ -585,21 +638,29 @@ class MultiGo2Service:
             )
             with self.lock:
                 device.auto_connect = True
-                self._persist_locked()
-            self.restore_tasks[device.number] = asyncio.create_task(self._restore_alignment(device.number))
+                saved = self._persist_locked()
+            phase = '保存连接配置'
+            if saved is not None:
+                await asyncio.wrap_future(saved)
+            device.connection_health = {"status": "checking", "message": "等待心跳响应"}
+            self.health_tasks[device.number] = asyncio.create_task(self._watch_connection(device.number, conn))
             return {"number": device.number, "ok": True, "avoid_enabled": avoid_enabled}
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
+            error = f'{phase}失败：{str(exc) or type(exc).__name__}'
+            logging.warning('Go2 #%s connection failed at %s (%s)', device.number, phase, type(exc).__name__)
             self.connections.pop(device.number, None)
             try:
                 if conn is not None:
-                    await conn.datachannel.disableTrafficSaving(False)
-                    await conn.disconnect()
+                    await asyncio.wait_for(conn.disconnect(), timeout=3.)
             except Exception:
                 pass
             self.set_status(
-                device.number, connected=False, avoid_enabled=False, busy=False, error=str(exc)
+                device.number, connected=False, avoid_enabled=False, busy=False, error=error
             )
-            return {"number": device.number, "ok": False, "error": str(exc)}
+            device.connection_health = {"status": "failed", "message": error}
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return {"number": device.number, "ok": False, "error": error}
 
     async def disconnect(self, numbers, preserve_auto=False):
         self.require_devices(numbers)
@@ -607,13 +668,31 @@ class MultiGo2Service:
         return results
 
     async def _disconnect_one(self, number, preserve_auto=False):
+        async with self.connection_locks.setdefault(number, asyncio.Lock()):
+            self.stopping_numbers[number] = self.stopping_numbers.get(number, 0) + 1
+            try:
+                return await self._disconnect_one_locked(number, preserve_auto)
+            finally:
+                count = self.stopping_numbers[number] - 1
+                if count:
+                    self.stopping_numbers[number] = count
+                else:
+                    self.stopping_numbers.pop(number, None)
+
+    async def _disconnect_one_locked(self, number, preserve_auto=False):
+        health_task = self.health_tasks.pop(number, None)
+        if health_task and health_task is not asyncio.current_task():
+            health_task.cancel()
+            await asyncio.gather(health_task, return_exceptions=True)
         if number in self.motion.participants:
             await self.motion.cancel()
         with self.lock:
             self._remember_alignment_locked(number)
             if not preserve_auto:
                 self.devices[number].auto_connect = False
-            self._persist_locked()
+            saved = self._persist_locked()
+        if saved is not None:
+            await asyncio.wrap_future(saved)
         restore_task = self.restore_tasks.pop(number, None)
         if restore_task:
             restore_task.cancel()
@@ -621,25 +700,108 @@ class MultiGo2Service:
         task = self.joystick_deadmen.pop(number, None)
         if task:
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        control_task = self.control_tasks.pop(number, None)
+        if control_task:
+            control_task.cancel()
+            await asyncio.gather(control_task, return_exceptions=True)
+        self.pending_motion_commands.pop(number, None)
+        stop_error = ''
+        conn = self.connections.get(number)
+        if conn and self._transport_open(conn):
+            result = await self._command_one(number, conn, 'stop', {})
+            if not result['ok']:
+                stop_error = result['error']
+        cloud_task = self.cloud_tasks.pop(number, None)
+        if cloud_task:
+            cloud_task.cancel()
+            await asyncio.gather(cloud_task, return_exceptions=True)
+        video_task = self.video_tasks.pop(number, None)
+        if video_task:
+            video_task.cancel()
+            await asyncio.gather(video_task, return_exceptions=True)
+        self.pending_clouds.pop(number, None)
+        self.cloud_epochs[number] = self.cloud_epochs.get(number, 0) + 1
         conn = self.connections.pop(number, None)
+        cleanup_error = stop_error
         if conn:
             try:
                 self._unsubscribe_telemetry(conn)
-                conn.datachannel.switchVideoChannel(False)
-                await conn.datachannel.disableTrafficSaving(False)
-                await conn.disconnect()
+                if self._transport_open(conn):
+                    conn.datachannel.switchVideoChannel(False)
+                    await asyncio.wait_for(conn.datachannel.disableTrafficSaving(False), timeout=1.)
             except Exception as exc:
-                self.set_status(number, connected=False, error=str(exc))
-                return {"number": number, "ok": False, "error": str(exc)}
-        self.set_status(number, connected=False, avoid_enabled=False, error="")
+                cleanup_error = '; '.join(filter(None, [cleanup_error, str(exc) or type(exc).__name__]))
+            finally:
+                try:
+                    await asyncio.wait_for(conn.disconnect(), timeout=3.)
+                except Exception as exc:
+                    cleanup_error = '; '.join(filter(None, [cleanup_error, str(exc) or type(exc).__name__]))
+        self.set_status(number, connected=False, avoid_enabled=False, busy=False, error=cleanup_error)
         with self.lock:
+            self.devices[number].cloud_enabled = False
+            self.devices[number].connection_health = {"status": "disconnected", "message": "已断开"}
             self.frames[number] = FrameState()
             video = self.videos.setdefault(number, VideoState())
             video.enabled = False
-        return {"number": number, "ok": True}
+        return {"number": number, "ok": not bool(cleanup_error), "error": cleanup_error}
+
+    @staticmethod
+    def _transport_open(conn):
+        pc = getattr(conn, 'pc', None)
+        if pc is not None and pc.connectionState in ('failed', 'closed', 'disconnected'):
+            return False
+        channel = getattr(conn.datachannel, 'channel', None)
+        return channel is None or channel.readyState == 'open'
+
+    def _connection_health(self, conn, started, now):
+        pc = getattr(conn, 'pc', None)
+        channel = getattr(conn.datachannel, 'channel', None)
+        heartbeat = getattr(conn.datachannel, 'last_heartbeat_monotonic', None)
+        received = getattr(conn.datachannel, 'last_rx_monotonic', None)
+        age = now - (heartbeat if heartbeat is not None else started)
+        peer = getattr(pc, 'connectionState', 'unknown')
+        ice = getattr(pc, 'iceConnectionState', 'unknown')
+        channel_state = getattr(channel, 'readyState', 'unknown')
+        failed = peer in ('failed', 'closed') or channel_state in ('closed', 'closing') or ice in ('failed', 'closed')
+        if failed:
+            status, message = 'failed', 'WebRTC 连接已断开，请重新连接'
+        elif age > 12:
+            status, message = 'timeout', '心跳响应超过 12 秒未更新，连接超时，请重新连接'
+        elif age > 6 or peer == 'disconnected' or ice == 'disconnected':
+            status, message = 'warning', '心跳响应延迟或网络暂时中断'
+        elif heartbeat is None:
+            status, message = 'checking', '等待心跳响应'
+        else:
+            status, message = 'healthy', '连接正常'
+        return {'status': status, 'message': message, 'peer_state': peer,
+                'ice_state': ice, 'channel_state': channel_state,
+                'heartbeat_age': round(age, 2) if heartbeat is not None else None,
+                'receive_age': round(now-received, 2) if received is not None else None,
+                'loop_lag_ms': round(self.loop_lag*1000, 1),
+                'decode_error': getattr(conn.datachannel, 'last_decode_error', '')}
+
+    async def _watch_connection(self, number, conn):
+        started = time.monotonic()
+        while not self.closed and self.connections.get(number) is conn:
+            health = self._connection_health(conn, started, time.monotonic())
+            with self.lock:
+                self.devices[number].connection_health = health
+            if health['status'] in ('failed', 'timeout'):
+                logging.warning('Go2 #%s disconnecting: %s', number, health)
+                await self._disconnect_one(number, preserve_auto=True)
+                with self.lock:
+                    self.devices[number].connection_health = health
+                    self.devices[number].error = health['message']
+                return
+            before = time.monotonic()
+            await asyncio.sleep(1.)
+            self.loop_lag = max(0., time.monotonic()-before-1.)
 
     def _subscribe_telemetry(self, number, conn):
         for name, topic in TELEMETRY_TOPICS.items():
+            if name == 'lidar_voxel':
+                continue
             def callback(message, number=number, topic=topic):
                 self._telemetry_callback(number, topic, message)
 
@@ -683,21 +845,117 @@ class MultiGo2Service:
                     frame.lidar["state_topic"] = topic
                     frame.lidar["state_time"] = time.time()
                 elif topic == RTC_TOPIC["ULIDAR_ARRAY"]:
-                    frame.lidar["voxel"] = compact_voxel_stats(message)
-                    frame.lidar["voxel_topic"] = topic
-                    frame.lidar["voxel_time"] = time.time()
-                    frame.raw_points = native_cloud_points(message)
-                    frame.cloud_time = time.time()
-                    frame.map_points = cloud_display_points(frame.raw_points, frame.map_to_local)
+                    if device.cloud_enabled:
+                        self.pending_clouds[number] = (message, time.time())
+                        task = self.cloud_tasks.get(number)
+                        if task is None or task.done():
+                            self.cloud_tasks[number] = asyncio.create_task(self._process_clouds(number))
             except Exception as exc:
                 frame.error = str(exc)
 
+    async def _process_clouds(self, number):
+        session = self.frames[number].session
+        epoch = self.cloud_epochs.get(number, 0)
+        while number in self.pending_clouds:
+            message, received_at = self.pending_clouds.pop(number)
+            with self.lock:
+                transform = dict(self.frames[number].map_to_local) if self.frames[number].map_to_local else None
+            try:
+                def process():
+                    points = native_cloud_points(message)
+                    return points, cloud_display_points(points, transform), compact_voxel_stats(message)
+                points, display, stats = await asyncio.to_thread(process)
+                with self.lock:
+                    frame = self.frames[number]
+                    if (number not in self.connections or not self.devices[number].cloud_enabled
+                            or frame.session != session or epoch != self.cloud_epochs.get(number, 0)):
+                        return
+                    frame.raw_points, frame.cloud_time = points, received_at
+                    if frame.map_to_local == transform:
+                        frame.map_points = display
+                    frame.lidar.update(voxel=stats, voxel_topic=RTC_TOPIC['ULIDAR_ARRAY'], voxel_time=received_at)
+            except Exception as exc:
+                with self.lock:
+                    if self.frames[number].session == session:
+                        self.frames[number].error = f'点云处理失败：{exc}'
+
+    async def point_cloud(self, numbers, enabled):
+        connections = self.connected_connections(numbers)
+        return await asyncio.gather(*(self._set_point_cloud(n, conn, enabled) for n, conn in connections))
+
+    async def _set_point_cloud(self, number, conn, enabled):
+        async with self.connection_locks.setdefault(number, asyncio.Lock()):
+            if self.connections.get(number) is not conn:
+                return {'number': number, 'ok': False, 'error': '连接已改变，请重新操作'}
+            return await self._set_point_cloud_unlocked(number, conn, enabled)
+
+    def _clear_cloud_locked(self, number):
+        frame = self.frames[number]
+        frame.cloud_time = 0.
+        frame.raw_points = np.empty((0, 3))
+        frame.map_points = []
+        for key in ('voxel', 'voxel_topic', 'voxel_time'):
+            frame.lidar.pop(key, None)
+        if not frame.aligned and self.devices[number].ip in self.saved_alignments:
+            frame.restore_status = '等待开启点云后验证旧标定'
+
+    async def _set_point_cloud_unlocked(self, number, conn, enabled):
+        device = self.devices[number]
+        try:
+            if device.cloud_enabled == enabled:
+                return {'number': number, 'ok': True, 'enabled': enabled}
+            self.cloud_epochs[number] = self.cloud_epochs.get(number, 0) + 1
+            self.pending_clouds.pop(number, None)
+            task = self.cloud_tasks.pop(number, None)
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            restore = self.restore_tasks.pop(number, None)
+            if restore:
+                restore.cancel()
+                await asyncio.gather(restore, return_exceptions=True)
+            conn.datachannel.set_lidar_enabled(enabled)
+            device.cloud_enabled = enabled
+            if not enabled:
+                with self.lock:
+                    self._clear_cloud_locked(number)
+            if enabled:
+                confirmed = await asyncio.wait_for(conn.datachannel.disableTrafficSaving(True), timeout=3.)
+                if confirmed is False:
+                    raise RuntimeError('机器人未确认开启点云流量')
+                conn.datachannel.pub_sub.subscribe(RTC_TOPIC['ULIDAR_ARRAY'],
+                    lambda message: self._telemetry_callback(number, RTC_TOPIC['ULIDAR_ARRAY'], message))
+                self.restore_tasks[number] = asyncio.create_task(self._restore_alignment(number))
+            else:
+                conn.datachannel.pub_sub.unsubscribe(RTC_TOPIC['ULIDAR_ARRAY'])
+                confirmed = await asyncio.wait_for(conn.datachannel.disableTrafficSaving(False), timeout=3.)
+                if confirmed is False:
+                    raise RuntimeError('机器人未确认恢复流量节省')
+            return {'number': number, 'ok': True, 'enabled': enabled}
+        except (Exception, asyncio.CancelledError) as exc:
+            device.cloud_enabled = False
+            with self.lock:
+                self._clear_cloud_locked(number)
+            conn.datachannel.set_lidar_enabled(False)
+            conn.datachannel.pub_sub.unsubscribe(RTC_TOPIC['ULIDAR_ARRAY'])
+            try:
+                await asyncio.wait_for(conn.datachannel.disableTrafficSaving(False), timeout=1.)
+            except Exception:
+                pass
+            error = f'点云切换失败：{str(exc) or type(exc).__name__}'
+            self.set_status(number, error=error)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return {'number': number, 'ok': False, 'enabled': False, 'error': error}
+
     def telemetry_payload(self):
         with self.lock:
-            return [
-                self.frames.setdefault(number, FrameState()).payload(number, self.devices[number])
-                for number in sorted(self.devices)
-            ]
+            robots = []
+            for number in sorted(self.devices):
+                robot = self.frames.setdefault(number, FrameState()).payload(number, self.devices[number])
+                robot.pop('map_points', None)  # Bulk points are served only by /api/map.
+                robots.append(robot)
+            return robots
 
     def map_payload(self):
         with self.lock:
@@ -716,6 +974,7 @@ class MultiGo2Service:
         with self.lock:
             if number not in self.devices:
                 raise ValueError(f"不存在的编号: {number}")
+            self._require_alignment_idle([number])
             frame = self.frames.setdefault(number, FrameState())
             if not self.devices[number].connected or not frame.local_pose or time.time() - frame.last_pose_time > 1:
                 raise ValueError(f"#{number} 定位数据缺失或已过期，不能标定")
@@ -729,15 +988,22 @@ class MultiGo2Service:
             self._persist_locked()
             return frame.payload(number, self.devices[number])
 
+    def _require_alignment_idle(self, numbers):
+        if self.motion.active or any(n in self.joystick_deadmen or n in self.pending_motion_commands or n in self.stopping_numbers or
+                time.monotonic() < self.action_until.get(n, 0) for n in numbers):
+            raise ValueError('请先停止运动并等待动作结束、全体站稳后再进行坐标对齐')
+
     def start_auto_alignment(self, numbers, reference_ip, layout=None):
         self.require_devices(numbers)
         with self.lock:
+            self._require_alignment_idle(numbers)
             if self.alignment_preview and not self.alignment_preview['done']:
                 raise ValueError('已有对齐任务正在运行，请等待完成')
             reference = next((d for d in self.devices.values() if d.ip == reference_ip), None)
             if not reference:
                 raise ValueError(f'参考狗 {reference_ip} 未添加，请先添加并连接')
             numbers = sorted(set(numbers) | {reference.number})
+            self._require_alignment_idle(numbers)
             snapshots, errors = {}, []
             for number in numbers:
                 device = self.devices[number]
@@ -750,7 +1016,7 @@ class MultiGo2Service:
                 elif not frame.local_pose or time.time() - frame.last_pose_time > 1:
                     reason = '定位已过期或缺失'
                 elif time.time() - frame.cloud_time > 3 or len(frame.raw_points) < 100:
-                    reason = '点云已过期或不足'
+                    reason = '请先开启点云并等待新鲜数据' if not device.cloud_enabled else '点云已过期或不足'
                 if reason:
                     if number == reference.number:
                         raise ValueError(f'参考狗不可用：{reason}')
@@ -763,7 +1029,9 @@ class MultiGo2Service:
                 raise ValueError('至少需要参考狗和另一台定位、点云均正常的设备')
             token = uuid.uuid4().hex
             self.alignment_preview = {'token': token, 'done': False, 'created': time.time(),
-                                      'reference': reference.number, 'results': errors, 'error': ''}
+                                      'reference': reference.number, 'mode': 'row' if layout else 'free',
+                                      'participants': numbers, 'snapshots': {n: {'pose': v['pose'], 'session': v['session']} for n, v in snapshots.items()},
+                                      'results': errors, 'error': ''}
         threading.Thread(target=self._auto_alignment_worker, args=(token, reference.number, snapshots), daemon=True).start()
         return token
 
@@ -813,6 +1081,7 @@ class MultiGo2Service:
             preview = self.alignment_preview
             if not preview or token != preview['token'] or not preview['done'] or preview['error']:
                 raise ValueError('对齐预览无效，请重新生成')
+            self._require_alignment_idle(preview.get('participants', []))
             if time.time() - preview['created'] > 300:
                 raise ValueError('预览超过 5 分钟，请重新生成')
             if not isinstance(adjustments, dict):
@@ -820,6 +1089,15 @@ class MultiGo2Service:
             if row_conflicts(preview['results'], adjustments):
                 raise ValueError('设备位置与左右顺序或相邻间距冲突，请重新检查预览')
             changes = []
+            # Reject a preview captured before a robot moved/reconnected; transforms
+            # must describe the same stationary snapshots used in matching.
+            for n, saved in preview.get('snapshots', {}).items():
+                frame, device = self.frames[n], self.devices[n]
+                pose = frame.local_pose
+                if frame.session != saved['session'] or not device.connected or not pose or time.time()-frame.last_pose_time > 1:
+                    raise ValueError(f'#{n} 连接或定位已变化，请重新生成预览')
+                if math.hypot(pose['x']-saved['pose']['x'], pose['y']-saved['pose']['y']) > .08 or abs(normalize_angle(pose['yaw']-saved['pose']['yaw'])) > .12:
+                    raise ValueError(f'#{n} 在预览期间移动或定位变化，请保持静止重新匹配')
             for result in preview['results']:
                 if 'transform' not in result:
                     continue
@@ -837,6 +1115,9 @@ class MultiGo2Service:
                 if frame.session != result['session'] or not device.connected or not frame.local_pose or time.time() - frame.last_pose_time > 1 or time.time() - frame.cloud_time > 3 or len(frame.raw_points) < 100:
                     raise ValueError(f"#{device.number} 定位或点云已过期，请恢复数据后重新对齐")
                 changes.append((device.number, frame, transform))
+            if not any(n != preview['reference'] for n, _, _ in changes):
+                raise ValueError('没有非参考机器通过匹配，请改善共同视野后重新采集')
+            self.return_points.clear()
             for _, frame in self.frames.items():
                 frame.restore_epoch += 1
                 frame.aligned = False
@@ -858,6 +1139,7 @@ class MultiGo2Service:
     def clear_alignment(self, numbers):
         self.require_devices(numbers)
         with self.lock:
+            self._require_alignment_idle(numbers)
             for number in numbers:
                 self.saved_alignments.pop(self.devices[number].ip, None)
                 self.frames[number].restore_epoch += 1
@@ -884,9 +1166,12 @@ class MultiGo2Service:
 
     def connected_connections(self, numbers):
         self.require_devices(numbers)
-        missing = [number for number in numbers if number not in self.connections]
+        missing = [number for number in numbers if number not in self.connections or not self.devices[number].connected]
         if missing:
             raise ValueError(f"以下 Go2 尚未连接: {missing}")
+        unavailable = [n for n in numbers if not self._transport_open(self.connections[n])]
+        if unavailable:
+            raise ValueError(f'以下 Go2 数据通道已断开，请重新连接：{unavailable}')
         return [(number, self.connections[number]) for number in numbers]
 
     async def command(self, numbers, name, parameters):
@@ -1060,9 +1345,21 @@ class MultiGo2Service:
                 task = self.joystick_deadmen.pop(number, None)
                 if task:
                     task.cancel()
-                self._publish_wireless_controller(conn)
-                self._move_without_reply(conn, 0., 0., 0.)
-                response = await self._sport_request(conn, SPORT_CMD["StopMove"])
+                failures = []
+                for label, send in (
+                    ('摇杆归零', lambda: self._publish_wireless_controller(conn)),
+                    ('零速度', lambda: self._move_without_reply(conn, 0., 0., 0.)),
+                ):
+                    try:
+                        send()
+                    except Exception as exc:
+                        failures.append(f'{label}：{exc}')
+                try:
+                    response = await self._sport_request(conn, SPORT_CMD["StopMove"])
+                except Exception as exc:
+                    failures.append(f'StopMove：{exc}')
+                if failures:
+                    raise RuntimeError('停止发送异常：' + '; '.join(failures))
             if response is not None:
                 code = nested(response, 'data', 'header', 'status', 'code')
                 if code is None:
@@ -1134,6 +1431,9 @@ class MultiGo2Service:
 
     @staticmethod
     def _publish_wireless_controller(conn, lx=0.0, ly=0.0, rx=0.0, ry=0.0, keys=0):
+        channel = conn.datachannel.pub_sub.channel
+        if channel is None or channel.readyState != 'open':
+            raise RuntimeError('摇杆指令未发送：WebRTC 数据通道未打开，请重新连接')
         conn.datachannel.pub_sub.publish_without_callback(
             RTC_TOPIC["WIRELESS_CONTROLLER"],
             {"lx": lx, "ly": ly, "rx": rx, "ry": ry, "keys": keys},
@@ -1186,27 +1486,55 @@ class MultiGo2Service:
                 video = self.videos.setdefault(number, VideoState())
                 video.enabled = enabled
                 video.error = ""
+                if not enabled:
+                    video.frame = None
+            if not enabled:
+                task = self.video_tasks.pop(number, None)
+                if task:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
         return [{"number": number, "ok": True, "enabled": enabled} for number, _conn in connections]
 
-    async def _video_track_reader(self, number, track):
+    async def _video_track_reader(self, number, track, conn=None):
+        next_frame = 0.
         while True:
             try:
                 frame = await track.recv()
-                image = frame.to_ndarray(format="bgr24")
-                ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                if not ok:
+                if conn is not None and self.connections.get(number) is not conn:
+                    return
+                now = time.monotonic()
+                task = self.video_tasks.get(number)
+                if (not self.videos[number].enabled or now < next_frame
+                        or (task is not None and not task.done())):
                     continue
-                with self.lock:
-                    video = self.videos.setdefault(number, VideoState())
-                    video.frame = encoded.tobytes()
-                    video.frame_time = time.time()
-                    video.height, video.width = image.shape[:2]
-                    video.frames += 1
-                    video.error = ""
+                next_frame = now + .2  # At most five JPEGs per second per robot.
+                self.video_tasks[number] = asyncio.create_task(self._encode_video_frame(number, frame, conn))
             except Exception as exc:
                 with self.lock:
-                    self.videos.setdefault(number, VideoState()).error = str(exc)
+                    if conn is None or self.connections.get(number) is conn:
+                        self.videos.setdefault(number, VideoState()).error = str(exc)
                 return
+
+    async def _encode_video_frame(self, number, frame, conn):
+        def encode():
+            image = frame.to_ndarray(format='bgr24')
+            ok, encoded = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            return encoded.tobytes() if ok else None, image.shape[:2]
+        try:
+            async with self.video_semaphore:
+                jpeg, shape = await asyncio.to_thread(encode)
+            with self.lock:
+                if jpeg is None or not self.videos[number].enabled or (conn is not None and self.connections.get(number) is not conn):
+                    return
+                video = self.videos[number]
+                video.frame, video.frame_time = jpeg, time.time()
+                video.height, video.width = shape
+                video.frames += 1
+                video.error = ''
+        except Exception as exc:
+            with self.lock:
+                if conn is None or self.connections.get(number) is conn:
+                    self.videos[number].error = str(exc)
 
     def video_payload(self):
         with self.lock:
@@ -1237,9 +1565,12 @@ class MultiGo2Service:
         if self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)
             self.thread.join(timeout=2.0)
+        self.state_writer.shutdown(wait=True)
 
 
-app = Flask(__name__, template_folder="wifi_web/templates", static_folder="wifi_web/static")
+_web_root = Path(__file__).resolve().parent
+_web_prefix = "wifi_web/" if (_web_root / "wifi_web/templates").is_dir() else ""
+app = Flask(__name__, template_folder=_web_prefix + "templates", static_folder=_web_prefix + "static")
 service = MultiGo2Service(state_path=Path(__file__).resolve().parent / '.local_state' / 'fleet.json')
 atexit.register(service.close)
 
@@ -1516,7 +1847,9 @@ def formation_parameters(data, numbers):
         data, "position_tolerance", CLOSED_LOOP_POSITION_TOLERANCE, 0.05, 0.5
     )
     yaw_tolerance = bounded_float(data, "yaw_tolerance", CLOSED_LOOP_YAW_TOLERANCE, 0.05, 0.8)
-    offsets = formation_offsets(numbers, pattern, spacing)
+    # Only slot geometry is needed here; formation() assigns slots using live poses.
+    validation_poses = {n: {'x': 0., 'y': float(i)} for i, n in enumerate(numbers)}
+    offsets = formation_offsets(numbers, pattern, spacing, validation_poses)
     max_distance = max(math.hypot(offset["x"], offset["y"]) for offset in offsets.values())
     if max_distance > MAX_FORMATION_DISTANCE:
         raise ValueError(f"队形最大位移 {max_distance:.2f} m 超出 {MAX_FORMATION_DISTANCE:.1f} m 安全限制")
@@ -1553,8 +1886,7 @@ def joystick_parameters(data):
         "x": x,
         "y": y,
         "z": z,
-        # Wireless horizontal stick +X is right; body-frame +Y is left.
-        "lx": -y / MAX_SPEED,
+        "lx": y / MAX_SPEED,
         "ly": x / MAX_SPEED,
         # Wireless right-stick +X is right; Sport positive yaw turns left.
         "rx": -z / MAX_YAW_RATE,
@@ -1581,7 +1913,7 @@ def sport_action_parameters(data):
     high_risk_activation = metadata["risk"] == "high" and not (
         metadata["parameter"] == "bool" and not bool_value(data.get("value", True))
     )
-    if high_risk_activation and not data.get("confirm_high_risk"):
+    if high_risk_activation and data.get("confirm_high_risk") is not True:
         raise ValueError("空翻、直立、卸力等高风险动作必须单独确认")
 
     parameter_type = metadata["parameter"]
@@ -1651,6 +1983,16 @@ def shared_map():
     return jsonify({"ok": True, **payload})
 
 
+@app.post('/api/point-cloud')
+def point_cloud():
+    data = request.get_json(silent=True) or {}
+    try:
+        results = service.submit(service.point_cloud(parse_numbers(data), bool_value(data.get('enabled', True))), timeout=8.)
+    except (ValueError, TimeoutError) as exc:
+        return payload_error(str(exc) or '点云切换超时')
+    return jsonify(ok=True, results=results, robots=service.telemetry_payload(), devices=service.list_devices())
+
+
 @app.get("/api/video/status")
 def video_status():
     return jsonify({"ok": True, "videos": service.video_payload()})
@@ -1692,12 +2034,21 @@ def align_frame():
 def auto_align():
     data = request.get_json(silent=True) or {}
     try:
-        reference_ip = parse_ip(data.get('reference_ip', '192.168.31.191'))
-        layout = parse_row_layout(data, reference_ip) if bool_value(data.get('layout_enabled', False)) else None
+        reference_ip, layout = alignment_parameters(data)
         token = service.start_auto_alignment(parse_numbers(data), reference_ip, layout)
     except ValueError as exc:
         return payload_error(str(exc))
     return jsonify(ok=True, token=token)
+
+
+def alignment_parameters(data):
+    reference_ip = parse_ip(str(data.get('reference_ip', '')).strip())
+    mode = data.get('alignment_mode')
+    if mode is None:  # Compatibility for the old interface; no layout by default.
+        mode = 'row' if bool_value(data.get('layout_enabled', False)) else 'free'
+    if mode not in {'free', 'row'}:
+        raise ValueError('标定模式必须是 free（任意摆放）或 row（横排辅助）')
+    return reference_ip, parse_row_layout(data, reference_ip) if mode == 'row' else None
 
 
 def parse_row_layout(data, reference_ip):
@@ -1731,7 +2082,7 @@ def auto_align_status(token):
         preview = service.alignment_preview
         if not preview or preview['token'] != token:
             return payload_error('预览不存在，请重新生成')
-        return jsonify(ok=True, **preview)
+        return jsonify(ok=True, **{k: v for k, v in preview.items() if k != 'snapshots'})
 
 
 @app.post('/api/frame/auto-align/apply')
@@ -1829,7 +2180,7 @@ def command():
             name == "sport_action"
             and (parameters["query"] or parameters["action"] == "StopMove")
         )
-        if requires_motion_confirmation and not data.get("confirm_motion"):
+        if requires_motion_confirmation and data.get("confirm_motion") is not True:
             raise ValueError("发送真机动作前必须开启安全确认")
         results = service.submit(service.command(numbers, name, parameters), timeout=12.0)
     except (ValueError, TimeoutError) as exc:
@@ -1843,9 +2194,9 @@ def formation():
     try:
         numbers = parse_numbers(data)
         parameters = formation_parameters(data, numbers)
-        if not data.get("confirm_motion"):
+        if data.get("confirm_motion") is not True:
             raise ValueError("自动列队会发送真机移动指令，请先开启安全确认")
-        if not data.get("confirm_formation"):
+        if data.get("confirm_formation") is not True:
             raise ValueError("闭环自动列队会驱动真机，必须单独确认队形区域安全")
         results = service.submit(service.formation(numbers, parameters), timeout=parameters['timeout'] + 8.0)
     except (ValueError, TimeoutError) as exc:
@@ -1883,7 +2234,7 @@ def motion_home():
         numbers = parse_numbers(data)
         async def operate():
             service.connected_connections(numbers)
-            if service.motion.active or any(n in service.stopping_numbers or n in service.pending_motion_commands or
+            if service.motion.active or any(n in service.joystick_deadmen or n in service.stopping_numbers or n in service.pending_motion_commands or
                     time.monotonic() < service.action_until.get(n, 0) for n in numbers):
                 raise ValueError('请等待动作保护期结束并确认全体站稳后操作')
             poses = service.motion.poses(numbers)
